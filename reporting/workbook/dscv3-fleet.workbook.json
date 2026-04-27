@@ -1,0 +1,104 @@
+{
+  "version": "Notebook/1.0",
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "## DSC v3 Fleet — compliance dashboard\n\nLast 30 days of runs ingested by the DSC v3 reporting Function. Filter by group / config below."
+      },
+      "name": "header"
+    },
+    {
+      "type": 9,
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "parameters": [
+          { "id": "p_time",  "version": "KqlParameterItem/1.0", "name": "TimeRange", "type": 4, "isRequired": true, "value": { "durationMs": 2592000000 }, "typeSettings": { "selectableValues": [ {"durationMs":3600000},{"durationMs":86400000},{"durationMs":604800000},{"durationMs":2592000000} ] } },
+          { "id": "p_group", "version": "KqlParameterItem/1.0", "name": "Group",     "type": 2, "isRequired": false, "multiSelect": true, "quote": "'", "delimiter": ",", "value": [ "*" ], "typeSettings": { "additionalResourceOptions": [ "value::all" ] }, "query": "DscV3RunSummary_CL | distinct Group", "queryType": 0, "resourceType": "microsoft.operationalinsights/workspaces" },
+          { "id": "p_config","version": "KqlParameterItem/1.0", "name": "Config",    "type": 2, "isRequired": false, "multiSelect": true, "quote": "'", "delimiter": ",", "value": [ "*" ], "typeSettings": { "additionalResourceOptions": [ "value::all" ] }, "query": "DscV3RunSummary_CL | distinct Config", "queryType": 0, "resourceType": "microsoft.operationalinsights/workspaces" }
+        ],
+        "style": "pills",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces"
+      },
+      "name": "params"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "DscV3RunSummary_CL\n| where TimeGenerated {TimeRange}\n| where Group in ({Group}) or '*' in ({Group})\n| where Config in ({Config}) or '*' in ({Config})\n| summarize Servers=dcount(Host), Runs=count(), Successful=countif(Success==true), Drifted=sumif(DriftedCount, DriftedCount>0)\n| extend SuccessPct = round(100.0*Successful/Runs, 1)",
+        "size": 4,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "tiles",
+        "tileSettings": {
+          "titleContent": { "columnMatch": "Servers",  "formatter": 1 },
+          "leftContent":  { "columnMatch": "SuccessPct","formatter": 1, "formatOptions": { "min": 0, "max": 100, "palette": "redGreen" } },
+          "showBorder": true
+        }
+      },
+      "name": "tiles-overall"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "DscV3RunSummary_CL\n| where TimeGenerated {TimeRange}\n| where Group in ({Group}) or '*' in ({Group})\n| where Config in ({Config}) or '*' in ({Config})\n| summarize Total=count(), Drifted=sumif(1, DriftedCount>0), Failed=countif(Success==false) by bin(TimeGenerated, 1h)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Run outcomes over time",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "timechart"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "DscV3RunSummary_CL\n| where TimeGenerated {TimeRange}\n| where Group in ({Group}) or '*' in ({Group})\n| where Config in ({Config}) or '*' in ({Config})\n| summarize arg_max(TimeGenerated, *) by Host, Config\n| summarize Configs=count(), Drifted=countif(DriftedCount>0), Failed=countif(Success==false) by Host\n| order by Drifted desc, Failed desc, Host asc",
+        "size": 0,
+        "title": "Per-server compliance (latest run per config)",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table",
+        "gridSettings": {
+          "formatters": [
+            { "columnMatch": "Drifted", "formatter": 8, "formatOptions": { "min": 0, "max": 5, "palette": "redGreen" } },
+            { "columnMatch": "Failed",  "formatter": 8, "formatOptions": { "min": 0, "max": 5, "palette": "redGreen" } }
+          ]
+        }
+      },
+      "name": "per-server"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "DscV3Run_CL\n| where TimeGenerated {TimeRange}\n| where Group in ({Group}) or '*' in ({Group})\n| where Config in ({Config}) or '*' in ({Config})\n| where Drifted == true\n| summarize Servers=dcount(Host), Drifts=count() by ResourceType, ResourceName\n| order by Drifts desc",
+        "size": 0,
+        "title": "Most-drifted resources",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "drifted-resources"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "DscV3Run_CL\n| where TimeGenerated {TimeRange}\n| where Error != ''\n| project TimeGenerated, Host, Group, Config, ResourceType, ResourceName, Error\n| order by TimeGenerated desc\n| take 200",
+        "size": 0,
+        "title": "Recent errors",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "errors"
+    }
+  ],
+  "fallbackResourceIds": [],
+  "$schema": "https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json"
+}

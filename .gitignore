@@ -1,0 +1,29 @@
+# PowerShell / build
+*.suo
+*.user
+[Bb]in/
+[Oo]bj/
+
+# Test output
+TestResults/
+*.trx
+coverage.xml
+
+# Local state
+runs/
+*.local.json
+*.local.yaml
+
+# IDE
+.vs/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Module dev
+modules/**/output/
+*.zip
+
+# OS
+Thumbs.db
+.DS_Store

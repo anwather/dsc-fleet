@@ -1,0 +1,17 @@
+{
+  "yaml.schemas": {
+    "./schemas/config-document.json": [
+      "configs/**/*.dsc.yaml",
+      "configs/**/*.dsc.yml"
+    ],
+    "./schemas/resource-manifest.json": [
+      "**/*.dsc.resource.yaml",
+      "**/*.dsc.resource.yml",
+      "**/*.dsc.resource.json"
+    ]
+  },
+  "files.associations": {
+    "*.dsc.yaml": "yaml",
+    "*.dsc.yml": "yaml"
+  }
+}
