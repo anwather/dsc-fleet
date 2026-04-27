@@ -443,12 +443,37 @@ $galleryModules = @(
     @{ Name = 'PSDscResources';       Description = 'Microsoft-maintained replacements for built-in Windows PowerShell DSC resources.' }
 )
 $galleryStatus = [ordered]@{}
+
+# Helper: Get-Module -ListAvailable caches the module table in PS 5.1, so a
+# freshly-installed module is invisible until the session restarts. Look at
+# the AllUsers module directory directly to bypass the cache.
+function Get-InstalledModuleInfo {
+    param([string]$Name)
+    $candidates = @(
+        Join-Path 'C:\Program Files\WindowsPowerShell\Modules' $Name
+        Join-Path 'C:\Program Files\PowerShell\Modules'        $Name
+    )
+    foreach ($base in $candidates) {
+        if (-not (Test-Path -LiteralPath $base)) { continue }
+        $verDir = Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -as [version] } |
+                  Sort-Object { [version]$_.Name } -Descending |
+                  Select-Object -First 1
+        if (-not $verDir) { continue }
+        $psd1 = Join-Path $verDir.FullName "$Name.psd1"
+        if (Test-Path -LiteralPath $psd1) {
+            return [pscustomobject]@{ Name = $Name; Version = $verDir.Name; Path = $psd1 }
+        }
+    }
+    return $null
+}
+
 foreach ($mod in $galleryModules) {
-    $existing = Get-Module -ListAvailable -Name $mod.Name | Sort-Object Version -Descending | Select-Object -First 1
+    $existing = Get-InstalledModuleInfo -Name $mod.Name
     if (-not $existing) {
         Write-Info "Installing $($mod.Name) from PSGallery"
         Install-PSResource -Name $mod.Name -Scope AllUsers -TrustRepository -Reinstall:$false -ErrorAction Stop
-        $existing = Get-Module -ListAvailable -Name $mod.Name | Sort-Object Version -Descending | Select-Object -First 1
+        $existing = Get-InstalledModuleInfo -Name $mod.Name
     } else {
         Write-Info "$($mod.Name) already present (v$($existing.Version))"
     }
@@ -456,7 +481,7 @@ foreach ($mod in $galleryModules) {
         Required    = $true
         Installed   = [bool]$existing
         Path        = if ($existing) { $existing.Path } else { $null }
-        Version     = if ($existing) { $existing.Version.ToString() } else { $null }
+        Version     = if ($existing) { $existing.Version } else { $null }
         Description = $mod.Description
     }
 }
