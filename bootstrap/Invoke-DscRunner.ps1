@@ -49,6 +49,8 @@
 #>
 [CmdletBinding()]
 param(
+    [ValidateSet('Git','Dashboard')]
+    [string]   $Mode              = 'Git',
     [string]   $RepoRoot          = 'C:\ProgramData\DscV3\repo',
     [string]   $StateRoot         = 'C:\ProgramData\DscV3\state',
     [string]   $RunsRoot          = 'C:\ProgramData\DscV3\runs',
@@ -59,19 +61,262 @@ param(
     [switch]   $Now,
     [switch]   $NoFetch,
     [switch]   $ValidateOnly,
-    [ValidateSet('','set','test')] [string] $ForceMode = ''
+    [ValidateSet('','set','test')] [string] $ForceMode = '',
+    # --- Dashboard mode ---
+    [string]   $AgentConfig       = 'C:\ProgramData\DscV3\agent.config.json',
+    [int]      $MaxAssignmentsPerCycle = 0   # 0 = no cap
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3.0
-
-# --- helpers -----------------------------------------------------------------
 
 function Write-RunnerLog {
     param([Parameter(Mandatory, Position = 0)] [string] $Message, [string] $Level = 'INFO')
     $line = "{0} [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK'), $Level, $Message
     Write-Host $line
 }
+
+# ============================================================================
+# Dashboard-mode entrypoint — agent ↔ dsc-fleet-dashboard wire protocol.
+# ============================================================================
+if ($Mode -eq 'Dashboard') {
+
+    # --- Lock file (skip overlapping runs) -----------------------------------
+    if (-not (Test-Path -LiteralPath $StateRoot)) { New-Item -ItemType Directory -Path $StateRoot -Force | Out-Null }
+    $lockPath = Join-Path $StateRoot 'runner.lock'
+    if (Test-Path -LiteralPath $lockPath) {
+        $lockAge = (Get-Date) - (Get-Item -LiteralPath $lockPath).LastWriteTime
+        if ($lockAge -lt [TimeSpan]::FromMinutes(60)) {
+            Write-RunnerLog -Level 'WARN' -Message "Lock file fresh ($([int]$lockAge.TotalMinutes) min) — exiting."
+            return
+        }
+        Write-RunnerLog -Level 'WARN' -Message "Stale lock found (age $([int]$lockAge.TotalMinutes) min) — overriding."
+        Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+    }
+    @{ pid = $PID; startedUtc = (Get-Date).ToUniversalTime().ToString('o') } |
+        ConvertTo-Json | Set-Content -LiteralPath $lockPath -Encoding UTF8
+
+    try {
+        if (-not (Test-Path -LiteralPath $AgentConfig)) { throw "Agent config not found: $AgentConfig" }
+        $cfg = Get-Content -Raw -LiteralPath $AgentConfig | ConvertFrom-Json
+        foreach ($key in 'DashboardUrl','AgentId','AgentApiKey') {
+            if (-not $cfg.PSObject.Properties.Name.Contains($key)) { throw "Agent config missing '$key'." }
+        }
+        $base    = $cfg.DashboardUrl.TrimEnd('/')
+        $agentId = $cfg.AgentId
+        $headers = @{ 'Authorization' = "Bearer $($cfg.AgentApiKey)"; 'Accept' = 'application/json' }
+        $etagCachePath = Join-Path $StateRoot 'assignments.etag'
+        $revCacheDir   = Join-Path $StateRoot 'revisions'
+        if (-not (Test-Path -LiteralPath $revCacheDir)) { New-Item -ItemType Directory -Path $revCacheDir -Force | Out-Null }
+        if (-not (Test-Path -LiteralPath $RunsRoot))    { New-Item -ItemType Directory -Path $RunsRoot    -Force | Out-Null }
+
+        # Resolve dsc once.
+        $dsc = (Get-Command dsc -ErrorAction SilentlyContinue)?.Source
+        if (-not $dsc) { throw "dsc.exe not on PATH." }
+
+        function Invoke-Dashboard {
+            param([Parameter(Mandatory)][string] $Method,
+                  [Parameter(Mandatory)][string] $Path,
+                  $Body = $null,
+                  [hashtable] $ExtraHeaders = @{})
+            $url = "$base$Path"
+            $h   = $headers.Clone()
+            foreach ($k in $ExtraHeaders.Keys) { $h[$k] = $ExtraHeaders[$k] }
+            $params = @{ Method = $Method; Uri = $url; Headers = $h; TimeoutSec = 60 }
+            if ($null -ne $Body) {
+                $params.ContentType = 'application/json'
+                $params.Body = ($Body | ConvertTo-Json -Depth 20 -Compress)
+            }
+            return Invoke-RestMethod @params
+        }
+
+        function Get-InstalledModuleList {
+            $out = @()
+            try {
+                Import-Module Microsoft.PowerShell.PSResourceGet -ErrorAction Stop
+                $rows = Get-InstalledPSResource -Scope AllUsers -ErrorAction SilentlyContinue
+                foreach ($r in $rows) { $out += @{ name = $r.Name; version = $r.Version.ToString() } }
+            } catch {
+                # Best-effort fallback to PowerShellGet v2.
+                try {
+                    $rows = Get-Module -ListAvailable | Group-Object Name | ForEach-Object { $_.Group | Sort-Object Version -Descending | Select-Object -First 1 }
+                    foreach ($r in $rows) { $out += @{ name = $r.Name; version = $r.Version.ToString() } }
+                } catch { }
+            }
+            # Dedup by name.
+            $hash = @{}
+            foreach ($m in $out) { if (-not $hash.ContainsKey($m.name)) { $hash[$m.name] = $m } }
+            return @($hash.Values)
+        }
+
+        function Send-Heartbeat {
+            $os = $null
+            try { $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop } catch { }
+            $dscVer = $null
+            try { $dscVer = (& $dsc --version 2>&1 | Out-String).Trim() } catch { }
+            $body = @{
+                osCaption    = $os?.Caption
+                osVersion    = $os?.Version
+                dscExeVersion = $dscVer
+                agentVersion = '0.1.0-dashboard'
+                modules      = Get-InstalledModuleList
+                serverTime   = (Get-Date).ToUniversalTime().ToString('o')
+            }
+            try {
+                $resp = Invoke-Dashboard -Method POST -Path "/api/agents/$agentId/heartbeat" -Body $body
+                Write-RunnerLog "heartbeat ok (server time $($resp.serverTime), poll $($resp.pollIntervalSeconds)s)"
+            } catch {
+                Write-RunnerLog -Level 'WARN' -Message "heartbeat failed: $_"
+            }
+        }
+
+        function Get-Assignments {
+            $h = @{}
+            if (Test-Path -LiteralPath $etagCachePath) {
+                $h['If-None-Match'] = (Get-Content -Raw -LiteralPath $etagCachePath).Trim()
+            }
+            try {
+                $resp = Invoke-WebRequest -Method GET -Uri "$base/api/agents/$agentId/assignments" `
+                    -Headers ($headers + $h) -TimeoutSec 60 -SkipHttpErrorCheck
+            } catch {
+                Write-RunnerLog -Level 'WARN' -Message "assignments fetch failed: $_"
+                return $null
+            }
+            if ($resp.StatusCode -eq 304) {
+                Write-RunnerLog 'assignments: 304 Not Modified'
+                return @{ NotModified = $true; Items = @() }
+            }
+            if ($resp.StatusCode -ne 200) {
+                Write-RunnerLog -Level 'WARN' -Message "assignments: HTTP $($resp.StatusCode)"
+                return $null
+            }
+            $etag = $resp.Headers['ETag']
+            if ($etag) {
+                if ($etag -is [array]) { $etag = $etag[0] }
+                $etag | Set-Content -LiteralPath $etagCachePath -Encoding UTF8 -NoNewline
+            }
+            $data = $resp.Content | ConvertFrom-Json
+            return @{ NotModified = $false; Items = @($data.assignments); ServerTime = $data.serverTime; PollSeconds = $data.pollIntervalSeconds }
+        }
+
+        function Get-RevisionYaml {
+            param([string] $RevisionId, [string] $ExpectedSha256)
+            $cached = Join-Path $revCacheDir "$RevisionId.dsc.yaml"
+            if (Test-Path -LiteralPath $cached) {
+                $existing = Get-FileHash -LiteralPath $cached -Algorithm SHA256
+                if ($existing.Hash.ToLowerInvariant() -eq $ExpectedSha256.ToLowerInvariant()) { return $cached }
+                Remove-Item -LiteralPath $cached -Force
+            }
+            $resp = Invoke-Dashboard -Method GET -Path "/api/agents/$agentId/revisions/$RevisionId"
+            $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($resp.yamlBody)
+            [System.IO.File]::WriteAllBytes($cached, $bytes)
+            $check = (Get-FileHash -LiteralPath $cached -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($check -ne $ExpectedSha256.ToLowerInvariant()) {
+                Remove-Item -LiteralPath $cached -Force -ErrorAction SilentlyContinue
+                throw "sha256 mismatch for revision $RevisionId (got $check, expected $ExpectedSha256)"
+            }
+            return $cached
+        }
+
+        function Invoke-DscApply {
+            param([string] $YamlPath, [string] $Verb)
+            $output = & $dsc config $Verb --file $YamlPath --output-format json 2>&1 | Out-String
+            return @{ ExitCode = $LASTEXITCODE; Output = $output }
+        }
+
+        function Send-RunResult {
+            param([hashtable] $Body)
+            try {
+                Invoke-Dashboard -Method POST -Path "/api/agents/$agentId/results" -Body $Body | Out-Null
+            } catch {
+                Write-RunnerLog -Level 'WARN' -Message "POST /results failed: $_"
+            }
+        }
+
+        function Send-RemovalAck {
+            param([string] $AssignmentId, [int] $Generation, [bool] $Success, [string] $Message = '')
+            try {
+                $body = @{ assignmentId = $AssignmentId; generation = $Generation; success = $Success; message = $Message }
+                Invoke-Dashboard -Method POST -Path "/api/agents/$agentId/removal-ack" -Body $body | Out-Null
+            } catch {
+                Write-RunnerLog -Level 'WARN' -Message "POST /removal-ack failed: $_"
+            }
+        }
+
+        # --- Cycle ----------------------------------------------------------
+        Send-Heartbeat
+        $assignmentResp = Get-Assignments
+        if ($null -eq $assignmentResp) {
+            Write-RunnerLog -Level 'WARN' -Message 'no assignment payload — exiting cycle'
+            return
+        }
+        if ($assignmentResp.NotModified) { return }
+        $items = $assignmentResp.Items
+        if ($MaxAssignmentsPerCycle -gt 0 -and $items.Count -gt $MaxAssignmentsPerCycle) {
+            $items = $items[0..($MaxAssignmentsPerCycle - 1)]
+        }
+
+        foreach ($a in $items) {
+            try {
+                if ($a.lifecycleState -eq 'removing') {
+                    Write-RunnerLog "removing assignment $($a.assignmentId) (config $($a.configId))"
+                    Send-RemovalAck -AssignmentId $a.assignmentId -Generation $a.generation -Success $true `
+                        -Message 'removal acknowledged (no uninstall handler implemented)'
+                    continue
+                }
+                if ($a.lifecycleState -ne 'active') { continue }
+                if ($a.prereqStatus -ne 'ready') {
+                    Write-RunnerLog "skip $($a.assignmentId): prereq=$($a.prereqStatus)"
+                    continue
+                }
+                if (-not $a.revisionId) {
+                    Write-RunnerLog -Level 'WARN' -Message "skip $($a.assignmentId): no revisionId"
+                    continue
+                }
+                $nextDue = $null
+                if ($a.nextDueAt) { $nextDue = [datetime]::Parse($a.nextDueAt, $null, [System.Globalization.DateTimeStyles]::RoundtripKind) }
+                if (-not $Now -and $nextDue -and (Get-Date).ToUniversalTime() -lt $nextDue) {
+                    Write-RunnerLog "skip $($a.assignmentId): next due $($a.nextDueAt)"
+                    continue
+                }
+                Write-RunnerLog "apply $($a.assignmentId) (rev $($a.revisionId), gen $($a.generation))"
+                $yamlPath = Get-RevisionYaml -RevisionId $a.revisionId -ExpectedSha256 $a.sourceSha256
+                $start = Get-Date
+                $runId = [guid]::NewGuid().ToString()
+                $result = Invoke-DscApply -YamlPath $yamlPath -Verb 'set'
+                $end = Get-Date
+                $hadErrors = $result.ExitCode -ne 0
+                $inDesired = -not $hadErrors
+                $body = @{
+                    assignmentId    = $a.assignmentId
+                    generation      = $a.generation
+                    runId           = $runId
+                    revisionId      = $a.revisionId
+                    exitCode        = $result.ExitCode
+                    hadErrors       = $hadErrors
+                    inDesiredState  = $inDesired
+                    durationMs      = [int]($end - $start).TotalMilliseconds
+                    startedAt       = $start.ToUniversalTime().ToString('o')
+                    finishedAt      = $end.ToUniversalTime().ToString('o')
+                    dscOutput       = @{ raw = $result.Output }
+                }
+                # Local capture too.
+                $jsonPath = Join-Path $RunsRoot "$runId.json"
+                $body | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+                Send-RunResult -Body $body
+            } catch {
+                Write-RunnerLog -Level 'ERROR' -Message "assignment $($a.assignmentId) failed: $_"
+            }
+        }
+    } finally {
+        Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+    }
+    return
+}
+
+# ============================================================================
+# Git mode (Phase 1, unchanged) — falls through here when -Mode Git (default).
+# ============================================================================
 
 function Get-ArcTag {
     # The Connected Machine agent exposes tags via IMDS. On a non-Arc box
