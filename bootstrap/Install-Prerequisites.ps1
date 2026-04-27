@@ -237,6 +237,27 @@ function Install-PwshDirect {
     }
 }
 
+function Install-VcRedistDirect {
+    # dsc.exe (Rust) and other native binaries require the VS 2015-2022 x64
+    # runtime (VCRUNTIME140.dll, VCRUNTIME140_1.dll, MSVCP140.dll). A fresh
+    # Windows Server image does not ship these.
+    $marker = 'C:\Windows\System32\VCRUNTIME140.dll'
+    if (Test-Path -LiteralPath $marker) {
+        Write-Info 'Visual C++ 2015-2022 x64 Runtime already present'
+        return
+    }
+    $url  = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
+    $dest = Join-Path $tempRoot 'vc_redist.x64.exe'
+    Write-Info "Installing Visual C++ 2015-2022 x64 Runtime from $url"
+    Invoke-FileDownload -Url $url -Destination $dest
+
+    $p = Start-Process -FilePath $dest -ArgumentList '/install','/quiet','/norestart' -Wait -PassThru -NoNewWindow
+    # 0 = success, 3010 = success-reboot, 1638 = newer already installed
+    if ($p.ExitCode -notin 0, 3010, 1638) {
+        throw "Visual C++ Redistributable install failed (exit $($p.ExitCode))."
+    }
+}
+
 function Install-DscDirect {
     param([Parameter(Mandatory)][string] $Version)
 
@@ -343,6 +364,7 @@ if ($dscCurrent) {
     }
 }
 if ($needDsc) {
+    Install-VcRedistDirect
     Install-DscDirect -Version $DscVersion
     $dsc = Resolve-Dsc
 }
