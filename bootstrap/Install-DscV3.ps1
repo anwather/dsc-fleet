@@ -2,27 +2,31 @@
 #requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    One-time bootstrap of a Windows Server for the dsc-fleet management system.
+    One-time bootstrap of a Windows Server for the dsc-fleet dashboard.
 
 .DESCRIPTION
     Idempotent. Safe to re-run. Performs:
       1. Installs all prerequisites by calling Install-Prerequisites.ps1
          (PowerShell 7, dsc.exe, git, PSResourceGet).
-      2. Clones (or refreshes) the *platform* repo (dsc-fleet) at $PlatformRef
-         and installs:
+      2. Creates the C:\ProgramData\DscV3 layout with locked-down ACL
+         (SYSTEM + Administrators full; Users read).
+      3. Clones (or refreshes) the *platform* repo (dsc-fleet) at $PlatformRef
+         into C:\ProgramData\DscV3\platform and installs:
              * DscV3.RegFile module to the AllUsers module path
              * Invoke-DscRunner.ps1 to C:\ProgramData\DscV3\bin
-      3. Clones the *configs* repo (dsc-fleet-configs) at $ConfigsRef into
-         C:\ProgramData\DscV3\repo. The runner refreshes this on each cycle.
-      4. Registers a SYSTEM scheduled task (DscV3-Apply) that invokes the
-         installed runner every 30 min with up to 30 min jitter.
 
-    Layout (lock-down: only SYSTEM + Administrators write):
-      C:\ProgramData\DscV3\bin       — installed runner script
-      C:\ProgramData\DscV3\platform  — checkout of dsc-fleet (read-only after install)
-      C:\ProgramData\DscV3\repo      — live checkout of dsc-fleet-configs
-      C:\ProgramData\DscV3\runs      — local fallback run logs (JSON)
-      C:\ProgramData\DscV3\state     — per-group cadence state files
+    NOTE: This script does NOT clone any configs repo and does NOT create the
+    DscV3-Apply scheduled task. Both responsibilities belong to
+    Register-DashboardAgent.ps1, which is invoked next during provisioning
+    with the dashboard URL + provision token. The runner is dashboard-only:
+    configurations are pulled from the API per-cycle, not from a git repo.
+
+    Layout:
+      C:\ProgramData\DscV3\bin       installed runner script
+      C:\ProgramData\DscV3\platform  checkout of dsc-fleet
+      C:\ProgramData\DscV3\runs      local fallback run logs (JSON)
+      C:\ProgramData\DscV3\state     per-cycle agent state files
+      C:\ProgramData\DscV3\bootstrap copy of the bootstrap scripts (provision job)
 
 .PARAMETER PlatformRepoUrl
     HTTPS URL of the platform repo (default: anwather/dsc-fleet on GitHub).
@@ -30,35 +34,21 @@
 .PARAMETER PlatformRef
     Branch or tag of the platform repo. Use a release tag in production.
 
-.PARAMETER ConfigsRepoUrl
-    HTTPS URL of the configs repo (default: anwather/dsc-fleet-configs on GitHub).
-
-.PARAMETER ConfigsRef
-    Branch or tag of the configs repo. Configs change frequently — 'main' is
-    fine here; the runner re-fetches each cycle.
-
 .PARAMETER DscVersion
     Pinned dsc.exe version. Default 3.1.3.
 
-.PARAMETER ScheduleStart
-    Start-of-day for the scheduled task (HH:mm). Repetition is every 30 min.
-
 .PARAMETER GitToken
-    Optional GitHub PAT for cloning private repos. Embedded into HTTPS URL as
-    https://oauth2:<token>@github.com/... and stripped from the on-disk remote.
+    Optional GitHub PAT for cloning a private platform repo.
 
 .PARAMETER WhatIf
     Show planned changes without applying.
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
-    [string] $PlatformRepoUrl   = 'https://github.com/anwather/dsc-fleet.git',
-    [string] $PlatformRef       = 'main',
-    [string] $ConfigsRepoUrl    = 'https://github.com/anwather/dsc-fleet-configs.git',
-    [string] $ConfigsRef        = 'main',
-    [string] $DscVersion        = '3.1.3',
-    [string] $ScheduleStart     = '03:00',
-    [string] $GitToken          = ''
+    [string] $PlatformRepoUrl = 'https://github.com/anwather/dsc-fleet.git',
+    [string] $PlatformRef     = 'main',
+    [string] $DscVersion      = '3.1.3',
+    [string] $GitToken        = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -69,7 +59,6 @@ $paths = @{
     Root     = $root
     Bin      = Join-Path $root 'bin'
     Platform = Join-Path $root 'platform'
-    Repo     = Join-Path $root 'repo'
     Runs     = Join-Path $root 'runs'
     State    = Join-Path $root 'state'
 }
@@ -93,7 +82,6 @@ if ($PSCmdlet.ShouldProcess($prereq, "Run with -DscVersion $DscVersion")) {
     if ($LASTEXITCODE -ne 0) { throw "Install-Prerequisites.ps1 reported missing components (exit $LASTEXITCODE). See C:\ProgramData\DscV3\prereq-status.json." }
 }
 
-# Resolve absolute tool paths from the prereq status file (SYSTEM has no PATH refresh)
 $status = Get-Content -Raw -LiteralPath (Join-Path $root 'prereq-status.json') | ConvertFrom-Json
 $pwshPath = $status.Components.Pwsh.Path
 $gitPath  = $status.Components.Git.Path
@@ -145,7 +133,6 @@ function Sync-GitRepo {
         & $gitPath clone --quiet $authedUrl $Dest | Out-Host
         & $gitPath -C $Dest -c advice.detachedHead=false checkout --force $Ref | Out-Host
     }
-    # Strip token from on-disk remote (always store the public URL there)
     & $gitPath -C $Dest remote set-url origin $Url | Out-Null
 }
 
@@ -164,8 +151,6 @@ if ($PSCmdlet.ShouldProcess($moduleDst, 'Replace module from platform checkout')
     if (Test-Path -LiteralPath $moduleDst) { Remove-Item -LiteralPath $moduleDst -Recurse -Force }
     Copy-Item -LiteralPath $moduleSrc -Destination $moduleDst -Recurse -Force
 }
-# Same module also available to PS7 sessions via PSModulePath, but we make it
-# explicit by mirroring to the PS7 AllUsers path too.
 $ps7ModuleDst = 'C:\Program Files\PowerShell\Modules\DscV3.RegFile'
 if (Test-Path 'C:\Program Files\PowerShell\Modules') {
     if ($PSCmdlet.ShouldProcess($ps7ModuleDst, 'Mirror module to PS7 AllUsers path')) {
@@ -173,7 +158,6 @@ if (Test-Path 'C:\Program Files\PowerShell\Modules') {
         Copy-Item -LiteralPath $moduleSrc -Destination $ps7ModuleDst -Recurse -Force
     }
 }
-# Clean up legacy DscV3.Discovery installs from earlier bootstrap runs (idempotent).
 foreach ($legacy in @(
     'C:\Program Files\WindowsPowerShell\Modules\DscV3.Discovery'
     'C:\Program Files\PowerShell\Modules\DscV3.Discovery'
@@ -192,50 +176,35 @@ if ($PSCmdlet.ShouldProcess($runnerDst, 'Copy runner')) {
     Copy-Item -LiteralPath $runnerSrc -Destination $runnerDst -Force
 }
 
-# Refresh DSC PowerShell adapter cache so new module shows up immediately.
 $cache = "$env:LOCALAPPDATA\dsc\PSAdapterCache.json"
 if (Test-Path -LiteralPath $cache) { Remove-Item -LiteralPath $cache -Force }
 
-# --- 6. Configs repo ---------------------------------------------------------
-Write-Step "Syncing configs repo $ConfigsRepoUrl ($ConfigsRef)"
-if ($PSCmdlet.ShouldProcess($paths.Repo, 'Sync configs repo')) {
-    Sync-GitRepo -Url $ConfigsRepoUrl -Ref $ConfigsRef -Dest $paths.Repo -Token $GitToken
+# --- 6. Remove any pre-existing DscV3-Apply task -----------------------------
+# Earlier versions of this script registered a git-mode scheduled task here.
+# Dashboard provisioning hands ownership of the task to
+# Register-DashboardAgent.ps1, so we proactively unregister any existing one
+# to make sure the dashboard re-registration is the only definition that
+# survives.
+$existing = Get-ScheduledTask -TaskName 'DscV3-Apply' -ErrorAction SilentlyContinue
+if ($existing) {
+    if ($PSCmdlet.ShouldProcess('DscV3-Apply', 'Unregister legacy scheduled task (will be re-created by Register-DashboardAgent)')) {
+        Unregister-ScheduledTask -TaskName 'DscV3-Apply' -Confirm:$false
+    }
 }
 
-# --- 7. Scheduled task -------------------------------------------------------
-Write-Step 'Registering scheduled task DscV3-Apply'
-$taskName  = 'DscV3-Apply'
-$argList   = @(
-    '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
-    '-File',  "`"$runnerDst`"",
-    '-RepoRoot', "`"$($paths.Repo)`"",
-    '-StateRoot',"`"$($paths.State)`"",
-    '-RunsRoot', "`"$($paths.Runs)`"",
-    '-ConfigsRepoUrl', $ConfigsRepoUrl,
-    '-ConfigsRef',     $ConfigsRef
-) -join ' '
-
-$action    = New-ScheduledTaskAction -Execute $pwshPath -Argument $argList
-$trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date $ScheduleStart) `
-               -RepetitionInterval (New-TimeSpan -Minutes 30)
-# RandomDelay must be an ISO-8601 duration string (e.g. PT30M), not TimeSpan.ToString().
-$trigger.RandomDelay = 'PT30M'
-$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-$settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                -StartWhenAvailable -MultipleInstances IgnoreNew `
-                -ExecutionTimeLimit (New-TimeSpan -Hours 2)
-
-if ($PSCmdlet.ShouldProcess($taskName, 'Register-ScheduledTask')) {
-    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
-        -Principal $principal -Settings $settings -Force | Out-Null
+# --- 7. Remove any stale legacy git-mode configs checkout --------------------
+$legacyRepo = Join-Path $root 'repo'
+if (Test-Path -LiteralPath $legacyRepo) {
+    if ($PSCmdlet.ShouldProcess($legacyRepo, 'Remove legacy configs checkout')) {
+        Remove-Item -LiteralPath $legacyRepo -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
-Write-Step 'Bootstrap complete'
+Write-Step 'Install-DscV3 complete'
 Write-Host @"
 
 Next:
-    Start-ScheduledTask -TaskName $taskName            # run immediately
-    Get-ScheduledTaskInfo -TaskName $taskName          # last run details
-    Get-ChildItem $($paths.Runs) | Sort LastWriteTime  # local run logs
+    Register-DashboardAgent.ps1 -DashboardUrl <url> -ProvisionToken <token>
+    (the dashboard provisioning job invokes that script automatically)
 
 "@
