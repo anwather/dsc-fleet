@@ -16,6 +16,15 @@ which holds the actual `.dsc.yaml` documents the runner applies.
 | `docs/`          | `pilot-rollout.md` — staged rollout plan.                                       |
 | `.github/`       | CI: lint + Pester + sync verify, on-tag release zips.                           |
 
+## Supported OS
+
+The bootstrap targets **Windows Server 2019, 2022, and 2025 (x64 only)**.
+PowerShell 5.1 is the only baseline requirement on the target machine —
+PowerShell 7, the DSC v3 CLI, and Git for Windows are pulled directly from
+their official GitHub release artifacts (MSI / zip / Inno installer). No
+winget required, so the bootstrap works under SYSTEM on a fresh image where
+App Installer has never been primed (or, on WS2019, doesn't exist at all).
+
 ## How a server gets onboarded
 
 ```powershell
@@ -30,7 +39,7 @@ which holds the actual `.dsc.yaml` documents the runner applies.
 
 The bootstrap:
 
-1. Calls `Install-Prerequisites.ps1` (winget, pwsh, dsc, git, PSResourceGet).
+1. Calls `Install-Prerequisites.ps1` (direct downloads of pwsh, dsc, git; PSResourceGet from PSGallery; winget detection-only).
 2. Clones this repo to `C:\ProgramData\DscV3\platform`.
 3. Installs `DscV3.Discovery` to the AllUsers module path.
 4. Installs `Invoke-DscRunner.ps1` to `C:\ProgramData\DscV3\bin\`.

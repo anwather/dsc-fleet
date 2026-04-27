@@ -5,12 +5,17 @@
     Install all prerequisites for DSC v3 fleet management on a Windows Server.
 
 .DESCRIPTION
-    SYSTEM-context safe. Installs (idempotently):
-      * winget (resolved by absolute path under C:\Program Files\WindowsApps)
-      * PowerShell 7        (Microsoft.PowerShell)
-      * DSC v3 CLI          (Microsoft.DSC, pinned)
-      * Git for Windows     (Git.Git)
-      * PSResourceGet       (NuGet provider trusted, PSGallery trusted, then Install-Module)
+    SYSTEM-context safe. Installs (idempotently) using *direct downloads* from
+    the official upstream release sources -- no winget required. winget on a
+    fresh Windows Server SYSTEM session is unreliable (App Installer must be
+    primed interactively first; on WS2019 it is not present at all), so the
+    bootstrap pulls each tool directly:
+
+      * PowerShell 7 (LTS)  -- MSI from github.com/PowerShell/PowerShell
+      * DSC v3 CLI          -- zip from github.com/PowerShell/DSC (pinned)
+      * Git for Windows     -- self-extracting installer from github.com/git-for-windows/git
+      * PSResourceGet       -- Install-Module from PSGallery (TLS 1.2 forced)
+      * winget              -- *detection only* (optional, recorded for diagnostics)
 
     All resolution uses absolute paths -- never relies on PATH being refreshed
     inside the current SYSTEM session.
@@ -18,14 +23,20 @@
     Emits a structured status object at the end so callers (Invoke-AzVMRunCommand,
     a remoting script, CI, etc.) can confirm "all green" with a single read.
 
+.NOTES
+    Supported operating systems: Windows Server 2019, 2022, 2025 (x64 only).
+    Older OSes will throw before any install runs.
+
 .PARAMETER DscVersion
-    Pinned dsc.exe winget version. Default 3.1.3.
+    Pinned DSC v3 release version (matches a tag in PowerShell/DSC). Default 3.1.3.
 
 .PARAMETER PwshVersion
-    Optional pinned PowerShell 7 winget version. Empty = latest.
+    Optional pinned PowerShell 7 LTS version (e.g. '7.4.6'). Empty = auto-detect
+    latest stable from the GitHub releases API.
 
 .PARAMETER GitVersion
-    Optional pinned Git for Windows winget version. Empty = latest.
+    Optional pinned Git for Windows version (e.g. '2.47.1'). Empty = auto-detect
+    latest stable from the GitHub releases API.
 
 .PARAMETER SkipGit
     Skip git installation (e.g. when you'll stage the repo another way).
@@ -52,6 +63,9 @@ $logRoot = 'C:\ProgramData\DscV3'
 if (-not (Test-Path -LiteralPath $logRoot)) { New-Item -ItemType Directory -Path $logRoot -Force | Out-Null }
 $logFile = Join-Path $logRoot 'prereq-install.log'
 
+$tempRoot = Join-Path $env:TEMP 'DscV3-bootstrap'
+if (-not (Test-Path -LiteralPath $tempRoot)) { New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null }
+
 function Write-Step([string] $msg) {
     $line = "[{0:yyyy-MM-ddTHH:mm:ssZ}] ==> {1}" -f [DateTime]::UtcNow, $msg
     Write-Host $line -ForegroundColor Cyan
@@ -65,42 +79,65 @@ function Write-Info([string] $msg) {
 }
 
 # ---------------------------------------------------------------------------
-# Locate winget by absolute path (SYSTEM does not have it on PATH)
+# OS gate -- WS2019 minimum, x64 only
 # ---------------------------------------------------------------------------
-function Get-WingetPath {
-    $candidate = Get-ChildItem -Path 'C:\Program Files\WindowsApps' `
-        -Filter winget.exe -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -match 'Microsoft\.DesktopAppInstaller_' } |
-        Sort-Object { [version]($_.Directory.Name -replace '^Microsoft\.DesktopAppInstaller_([\d\.]+).*','$1') } -Descending |
-        Select-Object -First 1 -ExpandProperty FullName
-    return $candidate
+function Assert-SupportedOS {
+    $os = Get-CimInstance Win32_OperatingSystem
+    $caption = $os.Caption
+    $version = [Version]$os.Version
+    $arch    = $os.OSArchitecture
+
+    Write-Info "Detected OS:       $caption"
+    Write-Info "Detected version:  $($os.Version)"
+    Write-Info "Architecture:      $arch"
+
+    if ($arch -notmatch '64') {
+        throw "Unsupported architecture '$arch'. dsc-fleet requires 64-bit Windows."
+    }
+    # Windows Server 2019 = NT 10.0.17763. Anything below that is unsupported.
+    if ($version -lt [Version]'10.0.17763') {
+        throw "Unsupported OS '$caption' (version $($os.Version)). dsc-fleet requires Windows Server 2019 or later."
+    }
+    return $caption
 }
 
-function Install-WingetPackage {
+# ---------------------------------------------------------------------------
+# Download helper with TLS1.2 + retries
+# ---------------------------------------------------------------------------
+function Invoke-FileDownload {
     param(
-        [Parameter(Mandatory)] [string] $Id,
-        [string] $Version = ''
+        [Parameter(Mandatory)] [string] $Url,
+        [Parameter(Mandatory)] [string] $Destination,
+        [int] $Retries = 3
     )
-    $winget = Get-WingetPath
-    if (-not $winget) {
-        throw "winget binary not found under C:\Program Files\WindowsApps. Install App Installer (Microsoft.DesktopAppInstaller) first."
-    }
-    $argsList = @(
-        'install', '--id', $Id, '--exact', '--silent',
-        '--accept-package-agreements', '--accept-source-agreements',
-        '--scope', 'machine'
-    )
-    if ($Version) { $argsList += @('--version', $Version) }
-    Write-Info "winget $($argsList -join ' ')"
-    & $winget @argsList 2>&1 | ForEach-Object { Write-Info $_ }
-    # winget exit codes: 0 = success, -1978335189 = no applicable update / already installed
-    if ($LASTEXITCODE -notin 0, -1978335189) {
-        throw "winget install $Id failed with exit code $LASTEXITCODE."
+    [Net.ServicePointManager]::SecurityProtocol = `
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            Write-Info "download (attempt $attempt): $Url"
+            $ProgressPreference = 'SilentlyContinue'
+            Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $Destination -ErrorAction Stop
+            return
+        } catch {
+            if ($attempt -ge $Retries) { throw }
+            Start-Sleep -Seconds (5 * $attempt)
+        }
     }
 }
 
+function Invoke-GitHubApi {
+    param([Parameter(Mandatory)] [string] $Url)
+    [Net.ServicePointManager]::SecurityProtocol = `
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $headers = @{ 'User-Agent' = 'dsc-fleet-bootstrap' }
+    return Invoke-RestMethod -UseBasicParsing -Uri $Url -Headers $headers -ErrorAction Stop
+}
+
 # ---------------------------------------------------------------------------
-# Component resolvers (absolute paths, post-install)
+# Component resolvers (absolute paths, post-install). StrictMode-safe:
+# never dereference .Source on a null result of Get-Command.
 # ---------------------------------------------------------------------------
 function Resolve-Pwsh {
     $candidates = @(
@@ -108,7 +145,8 @@ function Resolve-Pwsh {
         'C:\Program Files\PowerShell\7-preview\pwsh.exe'
     )
     foreach ($c in $candidates) { if (Test-Path -LiteralPath $c) { return $c } }
-    return (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+    $cmd = Get-Command pwsh -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source } else { return $null }
 }
 
 function Resolve-Dsc {
@@ -118,11 +156,12 @@ function Resolve-Dsc {
         "$env:ProgramFiles\WinGet\Links\dsc.exe"
     )
     foreach ($c in $candidates) { if (Test-Path -LiteralPath $c) { return $c } }
-    # Fall back to Get-ChildItem search across known winget targets
+    # Fall back to a recursive search under Program Files
     $found = Get-ChildItem -Path 'C:\Program Files' -Filter dsc.exe -Recurse -ErrorAction SilentlyContinue |
                 Select-Object -First 1 -ExpandProperty FullName
     if ($found) { return $found }
-    return (Get-Command dsc -ErrorAction SilentlyContinue).Source
+    $cmd = Get-Command dsc -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source } else { return $null }
 }
 
 function Resolve-Git {
@@ -131,7 +170,20 @@ function Resolve-Git {
         'C:\Program Files\Git\bin\git.exe'
     )
     foreach ($c in $candidates) { if (Test-Path -LiteralPath $c) { return $c } }
-    return (Get-Command git -ErrorAction SilentlyContinue).Source
+    $cmd = Get-Command git -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source } else { return $null }
+}
+
+function Get-WingetPath {
+    # Detection only -- not used to drive any installs.
+    $candidate = Get-ChildItem -Path 'C:\Program Files\WindowsApps' `
+        -Filter winget.exe -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match 'Microsoft\.DesktopAppInstaller_' } |
+        Sort-Object { [version]($_.Directory.Name -replace '^Microsoft\.DesktopAppInstaller_([\d\.]+).*','$1') } -Descending |
+        Select-Object -First 1 -ExpandProperty FullName
+    if ($candidate) { return $candidate }
+    $cmd = Get-Command winget -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source } else { return $null }
 }
 
 function Get-VersionSafe {
@@ -146,12 +198,129 @@ function Get-VersionSafe {
 }
 
 # ---------------------------------------------------------------------------
+# Direct installers
+# ---------------------------------------------------------------------------
+function Install-PwshDirect {
+    param([string] $Version)
+
+    if (-not $Version) {
+        Write-Info 'Resolving latest PowerShell 7 LTS release from GitHub'
+        # The /releases/latest endpoint follows the "Latest" flag, which
+        # PowerShell publishes for the current LTS.
+        try {
+            $rel = Invoke-GitHubApi 'https://api.github.com/repos/PowerShell/PowerShell/releases/latest'
+            $Version = ($rel.tag_name -replace '^v','')
+        } catch {
+            Write-Info "GitHub API lookup failed ($($_.Exception.Message)); falling back to pinned 7.4.6"
+            $Version = '7.4.6'
+        }
+    }
+    $msiName = "PowerShell-$Version-win-x64.msi"
+    $url     = "https://github.com/PowerShell/PowerShell/releases/download/v$Version/$msiName"
+    $dest    = Join-Path $tempRoot $msiName
+
+    Write-Info "Installing PowerShell $Version from $url"
+    Invoke-FileDownload -Url $url -Destination $dest
+
+    $msiArgs = @(
+        '/i', "`"$dest`"",
+        '/quiet', '/norestart',
+        'ADD_PATH=1',
+        'ENABLE_PSREMOTING=0',
+        'REGISTER_MANIFEST=1'
+    )
+    Write-Info "msiexec $($msiArgs -join ' ')"
+    $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -Wait -PassThru -NoNewWindow
+    # 0 = success, 3010 = success but reboot needed
+    if ($p.ExitCode -notin 0, 3010) {
+        throw "PowerShell 7 MSI install failed (exit $($p.ExitCode))."
+    }
+}
+
+function Install-DscDirect {
+    param([Parameter(Mandatory)][string] $Version)
+
+    $zipName = "DSC-$Version-x86_64-pc-windows-msvc.zip"
+    $url     = "https://github.com/PowerShell/DSC/releases/download/v$Version/$zipName"
+    $dest    = Join-Path $tempRoot $zipName
+    $extract = Join-Path $tempRoot "dsc-$Version"
+
+    Write-Info "Installing DSC v3 $Version from $url"
+    Invoke-FileDownload -Url $url -Destination $dest
+
+    if (Test-Path -LiteralPath $extract) { Remove-Item -LiteralPath $extract -Recurse -Force }
+    Expand-Archive -LiteralPath $dest -DestinationPath $extract -Force
+
+    $installDir = 'C:\Program Files\DSC'
+    if (-not (Test-Path -LiteralPath $installDir)) {
+        New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+    }
+    # Copy everything under the extract root into Program Files\DSC, replacing.
+    Get-ChildItem -LiteralPath $extract -Force | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $installDir -Recurse -Force
+    }
+
+    # Persist on machine PATH (idempotent, case-insensitive check)
+    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    if ($machinePath -notmatch [regex]::Escape($installDir)) {
+        Write-Info "Adding $installDir to machine PATH"
+        $newPath = ($machinePath.TrimEnd(';')) + ';' + $installDir
+        [Environment]::SetEnvironmentVariable('Path', $newPath, 'Machine')
+    } else {
+        Write-Info "$installDir already on machine PATH"
+    }
+}
+
+function Install-GitDirect {
+    param([string] $Version)
+
+    Write-Info 'Resolving Git for Windows release from GitHub'
+    try {
+        $rel = Invoke-GitHubApi 'https://api.github.com/repos/git-for-windows/git/releases/latest'
+        if (-not $Version) {
+            # Tags look like 'v2.47.1.windows.1' -- strip the v and the .windows.N suffix
+            $Version = ($rel.tag_name -replace '^v','' -replace '\.windows\.\d+$','')
+        }
+        # Asset name pattern: Git-2.47.1-64-bit.exe
+        $asset = $rel.assets | Where-Object { $_.name -match '^Git-[\d\.]+-64-bit\.exe$' } | Select-Object -First 1
+        if (-not $asset) { throw 'No Git-*-64-bit.exe asset on the latest release.' }
+        $url = $asset.browser_download_url
+        $exeName = $asset.name
+    } catch {
+        if (-not $Version) { $Version = '2.47.1' }
+        $exeName = "Git-$Version-64-bit.exe"
+        $url     = "https://github.com/git-for-windows/git/releases/download/v$Version.windows.1/$exeName"
+        Write-Info "GitHub API lookup failed ($($_.Exception.Message)); falling back to $url"
+    }
+
+    $dest = Join-Path $tempRoot $exeName
+    Write-Info "Installing Git for Windows from $url"
+    Invoke-FileDownload -Url $url -Destination $dest
+
+    $silentArgs = @(
+        '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/NOCANCEL',
+        '/SP-', '/CLOSEAPPLICATIONS', '/RESTARTAPPLICATIONS'
+    )
+    Write-Info "$exeName $($silentArgs -join ' ')"
+    $p = Start-Process -FilePath $dest -ArgumentList $silentArgs -Wait -PassThru -NoNewWindow
+    if ($p.ExitCode -ne 0) {
+        throw "Git for Windows installer failed (exit $($p.ExitCode))."
+    }
+}
+
+# ===========================================================================
+# Begin install
+# ===========================================================================
+Write-Step 'OS check'
+$osCaption = Assert-SupportedOS
+
+# ---------------------------------------------------------------------------
 # 1. PowerShell 7
 # ---------------------------------------------------------------------------
 Write-Step 'PowerShell 7'
 $pwsh = Resolve-Pwsh
 if (-not $pwsh) {
-    Install-WingetPackage -Id 'Microsoft.PowerShell' -Version $PwshVersion
+    Install-PwshDirect -Version $PwshVersion
     $pwsh = Resolve-Pwsh
 } else {
     Write-Info "Already present at $pwsh"
@@ -174,7 +343,7 @@ if ($dscCurrent) {
     }
 }
 if ($needDsc) {
-    Install-WingetPackage -Id 'Microsoft.DSC' -Version $DscVersion
+    Install-DscDirect -Version $DscVersion
     $dsc = Resolve-Dsc
 }
 
@@ -186,7 +355,7 @@ if (-not $SkipGit) {
     Write-Step 'Git for Windows'
     $git = Resolve-Git
     if (-not $git) {
-        Install-WingetPackage -Id 'Git.Git' -Version $GitVersion
+        Install-GitDirect -Version $GitVersion
         $git = Resolve-Git
     } else {
         Write-Info "Already present at $git"
@@ -199,7 +368,8 @@ if (-not $SkipGit) {
 # 4. PSResourceGet (PS 5.1 SYSTEM-safe install path)
 # ---------------------------------------------------------------------------
 Write-Step 'Microsoft.PowerShell.PSResourceGet'
-[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+[Net.ServicePointManager]::SecurityProtocol = `
+    [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
     Write-Info 'Installing NuGet PackageProvider'
     Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope AllUsers | Out-Null
@@ -217,18 +387,29 @@ if (-not $psrg) {
 }
 
 # ---------------------------------------------------------------------------
+# 5. Winget -- detection only (optional)
+# ---------------------------------------------------------------------------
+Write-Step 'Winget (detection only)'
+$winget = Get-WingetPath
+if ($winget) {
+    Write-Info "winget present at $winget"
+} else {
+    Write-Info 'winget not present (expected on WS2019; harmless on WS2022/2025 since bootstrap no longer requires it)'
+}
+
+# ---------------------------------------------------------------------------
 # Build status report
 # ---------------------------------------------------------------------------
 $status = [ordered]@{
     Timestamp     = [DateTime]::UtcNow.ToString('s') + 'Z'
     Host          = $env:COMPUTERNAME
-    OS            = (Get-CimInstance Win32_OperatingSystem).Caption
+    OS            = $osCaption
     Components    = [ordered]@{
         Pwsh = [ordered]@{
             Required  = $true
             Installed = [bool]$pwsh
             Path      = $pwsh
-            Version   = if ($pwsh) { Get-VersionSafe -ExePath $pwsh -Args @('-NoProfile','-Command','$PSVersionTable.PSVersion.ToString()') } else { $null }
+            Version   = if ($pwsh) { Get-VersionSafe -ExePath $pwsh -Arguments @('-NoProfile','-Command','$PSVersionTable.PSVersion.ToString()') } else { $null }
         }
         Dsc = [ordered]@{
             Required  = $true
@@ -250,10 +431,11 @@ $status = [ordered]@{
             Version   = if ($psrg) { $psrg.Version.ToString() } else { $null }
         }
         Winget = [ordered]@{
-            Required  = $true
-            Installed = [bool](Get-WingetPath)
-            Path      = (Get-WingetPath)
-            Version   = if (Get-WingetPath) { (Get-VersionSafe -ExePath (Get-WingetPath)) } else { $null }
+            # No longer required for bootstrap -- we direct-download everything.
+            Required  = $false
+            Installed = [bool]$winget
+            Path      = $winget
+            Version   = if ($winget) { (Get-VersionSafe -ExePath $winget) } else { $null }
         }
     }
 }
@@ -270,9 +452,17 @@ $status.Missing      = $missing
 $statusPath = Join-Path $logRoot 'prereq-status.json'
 ($status | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $statusPath -Encoding utf8
 
+# Best-effort cleanup of the temp download dir (don't fail the run if it's locked)
+try {
+    Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+} catch {
+    Write-Info "Temp cleanup failed (non-fatal): $($_.Exception.Message)"
+}
+
 # Console summary
 Write-Host ''
 Write-Host '================ DSC v3 Prerequisites ================' -ForegroundColor Cyan
+Write-Host ("  OS: {0}" -f $osCaption)
 foreach ($name in $status.Components.Keys) {
     $c = $status.Components[$name]
     $mark = if ($c.Installed) { '[ OK ]' } elseif ($c.Required) { '[FAIL]' } else { '[skip]' }
