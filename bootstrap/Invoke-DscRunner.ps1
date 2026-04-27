@@ -27,9 +27,6 @@
 .PARAMETER RunsRoot
     Where per-run JSON output is captured. Default: C:\ProgramData\DscV3\runs.
 
-.PARAMETER ReportingEndpoint
-    HTTPS URL accepting POSTs of run JSON. Empty string disables remote reporting.
-
 .PARAMETER OnlyGroup
     Restrict execution to a single named group, ignoring membership rules.
     Useful for ad-hoc remediation.
@@ -54,7 +51,6 @@ param(
     [string]   $RepoRoot          = 'C:\ProgramData\DscV3\repo',
     [string]   $StateRoot         = 'C:\ProgramData\DscV3\state',
     [string]   $RunsRoot          = 'C:\ProgramData\DscV3\runs',
-    [string]   $ReportingEndpoint = '',
     [string]   $ConfigsRepoUrl    = '',
     [string]   $ConfigsRef        = 'main',
     [string]   $OnlyGroup         = '',
@@ -418,18 +414,6 @@ function Test-CadenceDue {
     return ((Get-Date).ToUniversalTime() - $LastRunUtc) -ge $interval
 }
 
-function Send-RunReport {
-    param([string] $Endpoint, [hashtable] $Payload)
-    if (-not $Endpoint) { return }
-    try {
-        Invoke-RestMethod -Uri $Endpoint -Method Post -TimeoutSec 30 `
-            -ContentType 'application/json' `
-            -Body ($Payload | ConvertTo-Json -Depth 20) | Out-Null
-    } catch {
-        Write-RunnerLog -Level 'WARN' -Message "Reporting POST failed: $_"
-    }
-}
-
 # --- 1. Optionally fetch + checkout ------------------------------------------
 
 if (-not $NoFetch) {
@@ -546,8 +530,6 @@ foreach ($group in $applicableGroups) {
         }
         $jsonPath = Join-Path $RunsRoot "$runId.json"
         $payload | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
-
-        Send-RunReport -Endpoint $ReportingEndpoint -Payload $payload
 
         if ($exit -ne 0) {
             $groupResult = 'failed'

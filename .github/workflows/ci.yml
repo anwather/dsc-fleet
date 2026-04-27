@@ -67,7 +67,7 @@ jobs:
           New-Item -ItemType Directory _dist -Force | Out-Null
           Compress-Archive -Path modules/DscV3.RegFile `
             -DestinationPath "_dist/DscV3.RegFile-$tag.zip"
-          Compress-Archive -Path bootstrap,modules,reporting,schemas,docs,README.md `
+          Compress-Archive -Path bootstrap,modules,schemas,docs,README.md `
             -DestinationPath "_dist/dsc-fleet-$tag.zip"
       - uses: softprops/action-gh-release@v2
         with:

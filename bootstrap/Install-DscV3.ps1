@@ -37,9 +37,6 @@
     Branch or tag of the configs repo. Configs change frequently — 'main' is
     fine here; the runner re-fetches each cycle.
 
-.PARAMETER ReportingEndpoint
-    HTTPS URL of the Azure Function ingest endpoint. Empty disables remote reporting.
-
 .PARAMETER DscVersion
     Pinned dsc.exe version. Default 3.1.3.
 
@@ -59,7 +56,6 @@ param(
     [string] $PlatformRef       = 'main',
     [string] $ConfigsRepoUrl    = 'https://github.com/anwather/dsc-fleet-configs.git',
     [string] $ConfigsRef        = 'main',
-    [string] $ReportingEndpoint = '',
     [string] $DscVersion        = '3.1.3',
     [string] $ScheduleStart     = '03:00',
     [string] $GitToken          = ''
@@ -218,7 +214,6 @@ $argList   = @(
     '-ConfigsRepoUrl', $ConfigsRepoUrl,
     '-ConfigsRef',     $ConfigsRef
 ) -join ' '
-if ($ReportingEndpoint) { $argList += " -ReportingEndpoint `"$ReportingEndpoint`"" }
 
 $action    = New-ScheduledTaskAction -Execute $pwshPath -Argument $argList
 $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date $ScheduleStart) `
