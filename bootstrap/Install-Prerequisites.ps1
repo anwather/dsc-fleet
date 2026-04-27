@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 #requires -RunAsAdministrator
 <#
 .SYNOPSIS
@@ -135,10 +135,10 @@ function Resolve-Git {
 }
 
 function Get-VersionSafe {
-    param([string] $ExePath, [string[]] $Args = @('--version'))
+    param([string] $ExePath, [string[]] $Arguments = @('--version'))
     if (-not $ExePath -or -not (Test-Path -LiteralPath $ExePath)) { return $null }
     try {
-        $out = (& $ExePath @Args) 2>&1 | Select-Object -First 1
+        $out = (& $ExePath @Arguments) 2>&1 | Select-Object -First 1
         return ($out | Out-String).Trim()
     } catch {
         return "ERROR: $_"

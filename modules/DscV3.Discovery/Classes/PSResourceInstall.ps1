@@ -1,4 +1,4 @@
-# PSResourceInstall — install/remove a PowerShell module via PSResourceGet
+﻿# PSResourceInstall — install/remove a PowerShell module via PSResourceGet
 # (Microsoft.PowerShell.PSResourceGet, the PowerShellGet v3 successor).
 #
 # Key   : Name

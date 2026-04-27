@@ -1,4 +1,4 @@
-# DscV3.Discovery — root module (GENERATED — do not edit by hand).
+﻿# DscV3.Discovery — root module (GENERATED — do not edit by hand).
 #
 # Class-based DSC v3 resources for the Microsoft.DSC/PowerShell adapter.
 # All classes MUST live in this file (the adapter parses the .psm1 AST to
@@ -63,12 +63,12 @@ class ChocolateyPackage {
 
     [void] Set() {
         if ($this.Ensure -eq [Ensure]::Present) {
-            $args = @('install', $this.Name, '-y', '--no-progress',
+            $cliArgs = @('install', $this.Name, '-y', '--no-progress',
                       '--source', $this.Source)
             if ($this.Version -and $this.Version -ne 'Latest') {
-                $args += @('--version', $this.Version)
+                $cliArgs += @('--version', $this.Version)
             }
-            [ChocolateyPackage]::InvokeChoco($args)
+            [ChocolateyPackage]::InvokeChoco($cliArgs)
         }
         else {
             [ChocolateyPackage]::InvokeChoco(@('uninstall', $this.Name, '-y', '--no-progress'))
@@ -403,7 +403,7 @@ class RegFile {
             if (-not (Test-Path -LiteralPath $psPath)) { continue }
             if ([string]::IsNullOrEmpty($e.Name)) {
                 # Default value — clear it; never delete the key automatically.
-                try { Remove-ItemProperty -LiteralPath $psPath -Name '(default)' -ErrorAction Stop } catch { }
+                try { Remove-ItemProperty -LiteralPath $psPath -Name '(default)' -ErrorAction Stop } catch { Write-Verbose "Ignored: $_" }
             }
             else {
                 Remove-ItemProperty -LiteralPath $psPath -Name $e.Name -ErrorAction SilentlyContinue
@@ -612,19 +612,19 @@ class WingetPackage {
 
     [void] Set() {
         if ($this.Ensure -eq [Ensure]::Present) {
-            $args = @('install', '--id', $this.Id, '--exact',
+            $cliArgs = @('install', '--id', $this.Id, '--exact',
                       '--source', $this.Source, '--silent',
                       '--accept-package-agreements', '--accept-source-agreements')
             if ($this.Version -and $this.Version -ne 'Latest') {
-                $args += @('--version', $this.Version)
+                $cliArgs += @('--version', $this.Version)
             }
-            [WingetPackage]::InvokeWinget($args)
+            [WingetPackage]::InvokeWinget($cliArgs)
         }
         else {
-            $args = @('uninstall', '--id', $this.Id, '--exact',
+            $cliArgs = @('uninstall', '--id', $this.Id, '--exact',
                       '--source', $this.Source, '--silent',
                       '--accept-source-agreements')
-            [WingetPackage]::InvokeWinget($args)
+            [WingetPackage]::InvokeWinget($cliArgs)
         }
     }
 

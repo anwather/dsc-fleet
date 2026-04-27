@@ -1,4 +1,4 @@
-# WingetPackage — install/remove a Windows Package Manager (winget) package.
+﻿# WingetPackage — install/remove a Windows Package Manager (winget) package.
 #
 # Key   : Id           — winget package identifier (e.g. '7zip.7zip')
 # Drift : Version mismatch (when Version specified) or presence vs Ensure
@@ -49,19 +49,19 @@ class WingetPackage {
 
     [void] Set() {
         if ($this.Ensure -eq [Ensure]::Present) {
-            $args = @('install', '--id', $this.Id, '--exact',
+            $cliArgs = @('install', '--id', $this.Id, '--exact',
                       '--source', $this.Source, '--silent',
                       '--accept-package-agreements', '--accept-source-agreements')
             if ($this.Version -and $this.Version -ne 'Latest') {
-                $args += @('--version', $this.Version)
+                $cliArgs += @('--version', $this.Version)
             }
-            [WingetPackage]::InvokeWinget($args)
+            [WingetPackage]::InvokeWinget($cliArgs)
         }
         else {
-            $args = @('uninstall', '--id', $this.Id, '--exact',
+            $cliArgs = @('uninstall', '--id', $this.Id, '--exact',
                       '--source', $this.Source, '--silent',
                       '--accept-source-agreements')
-            [WingetPackage]::InvokeWinget($args)
+            [WingetPackage]::InvokeWinget($cliArgs)
         }
     }
 

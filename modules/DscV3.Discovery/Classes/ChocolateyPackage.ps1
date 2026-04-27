@@ -1,4 +1,4 @@
-# ChocolateyPackage — install/remove a Chocolatey package.
+﻿# ChocolateyPackage — install/remove a Chocolatey package.
 #
 # Key   : Name
 # Drift : Version mismatch (when Version specified) or presence vs Ensure
@@ -44,12 +44,12 @@ class ChocolateyPackage {
 
     [void] Set() {
         if ($this.Ensure -eq [Ensure]::Present) {
-            $args = @('install', $this.Name, '-y', '--no-progress',
+            $cliArgs = @('install', $this.Name, '-y', '--no-progress',
                       '--source', $this.Source)
             if ($this.Version -and $this.Version -ne 'Latest') {
-                $args += @('--version', $this.Version)
+                $cliArgs += @('--version', $this.Version)
             }
-            [ChocolateyPackage]::InvokeChoco($args)
+            [ChocolateyPackage]::InvokeChoco($cliArgs)
         }
         else {
             [ChocolateyPackage]::InvokeChoco(@('uninstall', $this.Name, '-y', '--no-progress'))

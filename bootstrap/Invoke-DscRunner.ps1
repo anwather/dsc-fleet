@@ -1,4 +1,4 @@
-#requires -Version 7.2
+﻿#requires -Version 7.2
 <#
 .SYNOPSIS
     Apply the DSC v3 configuration documents that target this server.
@@ -73,7 +73,7 @@ function Write-RunnerLog {
     Write-Host $line
 }
 
-function Get-ArcTags {
+function Get-ArcTag {
     # The Connected Machine agent exposes tags via IMDS. On a non-Arc box
     # the endpoint won't respond; treat as empty.
     try {
@@ -94,7 +94,7 @@ function Test-AdGroupMembership {
     # Computer SID-based check via .NET — works in domain context, returns
     # $false outside a domain.
     try {
-        $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetComputerDomain().Name
+        $null = [System.DirectoryServices.ActiveDirectory.Domain]::GetComputerDomain().Name
         $searcher = [System.DirectoryServices.DirectorySearcher]::new()
         $searcher.Filter = "(&(objectClass=computer)(name=$env:COMPUTERNAME))"
         $me = $searcher.FindOne()
@@ -229,7 +229,7 @@ if ($ValidateOnly) {
 
 # --- 3. Resolve membership ---------------------------------------------------
 
-$arcTags = Get-ArcTags
+$arcTags = Get-ArcTag
 $applicableGroups = @()
 if ($OnlyGroup) {
     if (-not $assignments.groups.ContainsKey($OnlyGroup)) { throw "Unknown group '$OnlyGroup'." }

@@ -1,4 +1,4 @@
-# MsiFromShare — install/remove a Windows Installer (MSI) package whose source
+﻿# MsiFromShare — install/remove a Windows Installer (MSI) package whose source
 # lives on an SMB share or local path. Detection uses the MSI ProductId so the
 # resource is independent of how the package was originally installed.
 #

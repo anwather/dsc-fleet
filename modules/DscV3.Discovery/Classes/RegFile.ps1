@@ -1,4 +1,4 @@
-# RegFile — bulk-import a Windows .reg file with idempotent verification.
+﻿# RegFile — bulk-import a Windows .reg file with idempotent verification.
 #
 # Key   : Path  — local or UNC path to the .reg file
 # Hash  : Optional SHA256 of the .reg file contents. If specified, the file's
@@ -90,7 +90,7 @@ class RegFile {
             if (-not (Test-Path -LiteralPath $psPath)) { continue }
             if ([string]::IsNullOrEmpty($e.Name)) {
                 # Default value — clear it; never delete the key automatically.
-                try { Remove-ItemProperty -LiteralPath $psPath -Name '(default)' -ErrorAction Stop } catch { }
+                try { Remove-ItemProperty -LiteralPath $psPath -Name '(default)' -ErrorAction Stop } catch { Write-Verbose "Ignored: $_" }
             }
             else {
                 Remove-ItemProperty -LiteralPath $psPath -Name $e.Name -ErrorAction SilentlyContinue

@@ -1,4 +1,4 @@
-#requires -Version 7.2
+﻿#requires -Version 7.2
 <#
 .SYNOPSIS
     Concatenates Classes/*.ps1 into DscV3.Discovery.psm1.
@@ -77,5 +77,5 @@ if ($Verify) {
     exit 0
 }
 
-Set-Content -LiteralPath $psm1Path -Value $expected -Encoding UTF8 -NoNewline:$false
+Set-Content -LiteralPath $psm1Path -Value $expected -Encoding utf8BOM -NoNewline:$false
 Write-Host "Wrote $psm1Path ($($expected.Length) bytes from $($classFiles.Count) class files)." -ForegroundColor Green

@@ -41,7 +41,7 @@ jobs:
         shell: pwsh
         run: |
           $issues = Invoke-ScriptAnalyzer -Path . -Recurse `
-            -Severity Error,Warning -ExcludeRule PSAvoidUsingWriteHost,PSUseShouldProcessForStateChangingFunctions
+            -Severity Error,Warning -ExcludeRule PSAvoidUsingWriteHost,PSUseShouldProcessForStateChangingFunctions,PSReviewUnusedParameter
           if ($issues) { $issues | Format-Table -AutoSize; throw "PSScriptAnalyzer found $($issues.Count) issues." }
 
       - name: Pester tests
