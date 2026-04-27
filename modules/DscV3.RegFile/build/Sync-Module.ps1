@@ -1,7 +1,7 @@
 ﻿#requires -Version 7.2
 <#
 .SYNOPSIS
-    Concatenates Classes/*.ps1 into DscV3.Discovery.psm1.
+    Concatenates Classes/*.ps1 into DscV3.RegFile.psm1.
 
 .DESCRIPTION
     The DSC v3 PowerShell adapter discovers class-based resources by parsing
@@ -28,15 +28,16 @@ Set-StrictMode -Version 3.0
 
 $moduleRoot = Split-Path -Parent $PSScriptRoot
 $classDir   = Join-Path $moduleRoot 'Classes'
-$psm1Path   = Join-Path $moduleRoot 'DscV3.Discovery.psm1'
+$psm1Path   = Join-Path $moduleRoot 'DscV3.RegFile.psm1'
 
 # Stable load order — alphabetical except where noted (none currently inherit).
-$classFiles = Get-ChildItem -LiteralPath $classDir -Filter '*.ps1' | Sort-Object Name
+# Wrap in @() so a single-file result is still an array (StrictMode-safe .Count).
+$classFiles = @(Get-ChildItem -LiteralPath $classDir -Filter '*.ps1' | Sort-Object Name)
 
 $header = @'
-# DscV3.Discovery — root module (GENERATED — do not edit by hand).
+# DscV3.RegFile — root module (GENERATED — do not edit by hand).
 #
-# Class-based DSC v3 resources for the Microsoft.DSC/PowerShell adapter.
+# Class-based DSC v3 resource for the Microsoft.DSC/PowerShell adapter.
 # All classes MUST live in this file (the adapter parses the .psm1 AST to
 # discover [DscResource()]-decorated classes; dot-sourced classes are not
 # visible to that scan). Edit individual class files in Classes\ for dev,
@@ -70,10 +71,10 @@ if ($Verify) {
     $a = ($actual   -replace "`r`n", "`n").TrimEnd()
     $b = ($expected -replace "`r`n", "`n").TrimEnd()
     if ($a -ne $b) {
-        Write-Error "DscV3.Discovery.psm1 is out of sync with Classes\*.ps1. Run build\Sync-Module.ps1."
+        Write-Error "DscV3.RegFile.psm1 is out of sync with Classes\*.ps1. Run build\Sync-Module.ps1."
         exit 1
     }
-    Write-Host "DscV3.Discovery.psm1 is in sync." -ForegroundColor Green
+    Write-Host "DscV3.RegFile.psm1 is in sync." -ForegroundColor Green
     exit 0
 }
 

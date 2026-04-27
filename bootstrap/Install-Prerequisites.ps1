@@ -409,6 +409,59 @@ if (-not $psrg) {
 }
 
 # ---------------------------------------------------------------------------
+# 4b. PSGallery modules installed via PSResourceGet
+#     - Microsoft.WinGet.DSC : Microsoft-published class-based DSC v3
+#                              WinGetPackage resource (loaded by the
+#                              Microsoft.DSC/PowerShell adapter automatically).
+#     - PSDscResources       : Microsoft-maintained replacements for the
+#                              Windows PowerShell built-in DSC resources
+#                              (MsiPackage, Service, WindowsFeature, etc.)
+#                              loaded via Microsoft.Windows/WindowsPowerShell.
+# ---------------------------------------------------------------------------
+Write-Step 'PSGallery modules (Microsoft.WinGet.DSC, PSDscResources) via PSResourceGet'
+# Import the freshly-installed PSResourceGet module into the *current* PS 5.1
+# session before invoking Install-PSResource.
+try {
+    Import-Module Microsoft.PowerShell.PSResourceGet -Force -ErrorAction Stop
+} catch {
+    Write-Info "Import-Module Microsoft.PowerShell.PSResourceGet failed: $($_.Exception.Message)"
+    throw
+}
+# Ensure PSGallery is trusted in the PSResourceGet repo store (separate from
+# the legacy PowerShellGet PSRepository trust set above).
+$psgRepo = Get-PSResourceRepository -Name PSGallery -ErrorAction SilentlyContinue
+if (-not $psgRepo) {
+    Write-Info 'Registering PSGallery in PSResourceGet repo store'
+    Register-PSResourceRepository -PSGallery -Trusted -ErrorAction Stop
+} elseif (-not $psgRepo.Trusted) {
+    Write-Info 'Marking PSResourceGet PSGallery repo as Trusted'
+    Set-PSResourceRepository -Name PSGallery -Trusted -ErrorAction Stop
+}
+
+$galleryModules = @(
+    @{ Name = 'Microsoft.WinGet.DSC'; Description = 'Microsoft-published WinGetPackage class-based DSC v3 resource.' }
+    @{ Name = 'PSDscResources';       Description = 'Microsoft-maintained replacements for built-in Windows PowerShell DSC resources.' }
+)
+$galleryStatus = [ordered]@{}
+foreach ($mod in $galleryModules) {
+    $existing = Get-Module -ListAvailable -Name $mod.Name | Sort-Object Version -Descending | Select-Object -First 1
+    if (-not $existing) {
+        Write-Info "Installing $($mod.Name) from PSGallery"
+        Install-PSResource -Name $mod.Name -Scope AllUsers -TrustRepository -Reinstall:$false -ErrorAction Stop
+        $existing = Get-Module -ListAvailable -Name $mod.Name | Sort-Object Version -Descending | Select-Object -First 1
+    } else {
+        Write-Info "$($mod.Name) already present (v$($existing.Version))"
+    }
+    $galleryStatus[$mod.Name] = [ordered]@{
+        Required    = $true
+        Installed   = [bool]$existing
+        Path        = if ($existing) { $existing.Path } else { $null }
+        Version     = if ($existing) { $existing.Version.ToString() } else { $null }
+        Description = $mod.Description
+    }
+}
+
+# ---------------------------------------------------------------------------
 # 5. Winget -- detection only (optional)
 # ---------------------------------------------------------------------------
 Write-Step 'Winget (detection only)'
@@ -459,13 +512,19 @@ $status = [ordered]@{
             Path      = $winget
             Version   = if ($winget) { (Get-VersionSafe -ExePath $winget) } else { $null }
         }
+        GalleryModules = $galleryStatus
     }
 }
 
 $missing = @()
 foreach ($name in $status.Components.Keys) {
+    if ($name -eq 'GalleryModules') { continue }
     $c = $status.Components[$name]
     if ($c.Required -and -not $c.Installed) { $missing += $name }
+}
+foreach ($modName in $status.Components.GalleryModules.Keys) {
+    $g = $status.Components.GalleryModules[$modName]
+    if ($g.Required -and -not $g.Installed) { $missing += "GalleryModule:$modName" }
 }
 $status.AllInstalled = ($missing.Count -eq 0)
 $status.Missing      = $missing
@@ -486,12 +545,21 @@ Write-Host ''
 Write-Host '================ DSC v3 Prerequisites ================' -ForegroundColor Cyan
 Write-Host ("  OS: {0}" -f $osCaption)
 foreach ($name in $status.Components.Keys) {
+    if ($name -eq 'GalleryModules') { continue }
     $c = $status.Components[$name]
     $mark = if ($c.Installed) { '[ OK ]' } elseif ($c.Required) { '[FAIL]' } else { '[skip]' }
     $color = if ($c.Installed) { 'Green' } elseif ($c.Required) { 'Red' } else { 'Yellow' }
     $ver = if ($c.Version) { " v$($c.Version)" } else { '' }
     Write-Host ("  {0}  {1,-15}{2}" -f $mark, $name, $ver) -ForegroundColor $color
     if ($c.Path) { Write-Host ("           {0}" -f $c.Path) -ForegroundColor DarkGray }
+}
+foreach ($modName in $status.Components.GalleryModules.Keys) {
+    $g = $status.Components.GalleryModules[$modName]
+    $mark = if ($g.Installed) { '[ OK ]' } elseif ($g.Required) { '[FAIL]' } else { '[skip]' }
+    $color = if ($g.Installed) { 'Green' } elseif ($g.Required) { 'Red' } else { 'Yellow' }
+    $ver = if ($g.Version) { " v$($g.Version)" } else { '' }
+    Write-Host ("  {0}  {1,-30}{2}" -f $mark, $modName, $ver) -ForegroundColor $color
+    if ($g.Path) { Write-Host ("           {0}" -f $g.Path) -ForegroundColor DarkGray }
 }
 Write-Host ''
 if ($status.AllInstalled) {

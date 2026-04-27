@@ -35,7 +35,7 @@ jobs:
 
       - name: Verify module is in sync with Classes/*.ps1
         shell: pwsh
-        run: ./modules/DscV3.Discovery/build/Sync-Module.ps1 -Verify
+        run: ./modules/DscV3.RegFile/build/Sync-Module.ps1 -Verify
 
       - name: PSScriptAnalyzer
         shell: pwsh
@@ -65,8 +65,8 @@ jobs:
         run: |
           $tag = "${{ github.ref_name }}"
           New-Item -ItemType Directory _dist -Force | Out-Null
-          Compress-Archive -Path modules/DscV3.Discovery `
-            -DestinationPath "_dist/DscV3.Discovery-$tag.zip"
+          Compress-Archive -Path modules/DscV3.RegFile `
+            -DestinationPath "_dist/DscV3.RegFile-$tag.zip"
           Compress-Archive -Path bootstrap,modules,reporting,schemas,docs,README.md `
             -DestinationPath "_dist/dsc-fleet-$tag.zip"
       - uses: softprops/action-gh-release@v2

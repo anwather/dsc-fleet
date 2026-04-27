@@ -10,7 +10,7 @@
          (PowerShell 7, dsc.exe, git, PSResourceGet).
       2. Clones (or refreshes) the *platform* repo (dsc-fleet) at $PlatformRef
          and installs:
-             * DscV3.Discovery module to the AllUsers module path
+             * DscV3.RegFile module to the AllUsers module path
              * Invoke-DscRunner.ps1 to C:\ProgramData\DscV3\bin
       3. Clones the *configs* repo (dsc-fleet-configs) at $ConfigsRef into
          C:\ProgramData\DscV3\repo. The runner refreshes this on each cycle.
@@ -160,9 +160,9 @@ if ($PSCmdlet.ShouldProcess($paths.Platform, 'Sync platform repo')) {
 }
 
 # --- 5. Install module + runner from platform repo ---------------------------
-Write-Step 'Installing DscV3.Discovery module to AllUsers module path'
-$moduleSrc = Join-Path $paths.Platform 'modules\DscV3.Discovery'
-$moduleDst = 'C:\Program Files\WindowsPowerShell\Modules\DscV3.Discovery'
+Write-Step 'Installing DscV3.RegFile module to AllUsers module path'
+$moduleSrc = Join-Path $paths.Platform 'modules\DscV3.RegFile'
+$moduleDst = 'C:\Program Files\WindowsPowerShell\Modules\DscV3.RegFile'
 if (-not (Test-Path -LiteralPath $moduleSrc)) { throw "Module source missing: $moduleSrc" }
 if ($PSCmdlet.ShouldProcess($moduleDst, 'Replace module from platform checkout')) {
     if (Test-Path -LiteralPath $moduleDst) { Remove-Item -LiteralPath $moduleDst -Recurse -Force }
@@ -170,11 +170,21 @@ if ($PSCmdlet.ShouldProcess($moduleDst, 'Replace module from platform checkout')
 }
 # Same module also available to PS7 sessions via PSModulePath, but we make it
 # explicit by mirroring to the PS7 AllUsers path too.
-$ps7ModuleDst = 'C:\Program Files\PowerShell\Modules\DscV3.Discovery'
+$ps7ModuleDst = 'C:\Program Files\PowerShell\Modules\DscV3.RegFile'
 if (Test-Path 'C:\Program Files\PowerShell\Modules') {
     if ($PSCmdlet.ShouldProcess($ps7ModuleDst, 'Mirror module to PS7 AllUsers path')) {
         if (Test-Path -LiteralPath $ps7ModuleDst) { Remove-Item -LiteralPath $ps7ModuleDst -Recurse -Force }
         Copy-Item -LiteralPath $moduleSrc -Destination $ps7ModuleDst -Recurse -Force
+    }
+}
+# Clean up legacy DscV3.Discovery installs from earlier bootstrap runs (idempotent).
+foreach ($legacy in @(
+    'C:\Program Files\WindowsPowerShell\Modules\DscV3.Discovery'
+    'C:\Program Files\PowerShell\Modules\DscV3.Discovery'
+)) {
+    if (Test-Path -LiteralPath $legacy) {
+        Write-Host "    removing legacy module: $legacy"
+        Remove-Item -LiteralPath $legacy -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
