@@ -213,7 +213,8 @@ if ($ReportingEndpoint) { $argList += " -ReportingEndpoint `"$ReportingEndpoint`
 $action    = New-ScheduledTaskAction -Execute $pwshPath -Argument $argList
 $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date $ScheduleStart) `
                -RepetitionInterval (New-TimeSpan -Minutes 30)
-$trigger.RandomDelay = (New-TimeSpan -Minutes 30).ToString()
+# RandomDelay must be an ISO-8601 duration string (e.g. PT30M), not TimeSpan.ToString().
+$trigger.RandomDelay = 'PT30M'
 $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                 -StartWhenAvailable -MultipleInstances IgnoreNew `
