@@ -3,24 +3,23 @@
 The **platform** repo for managing DSC v3 across a fleet of Windows Servers
 (Azure VM + Arc). Pairs with:
 
-- **[anwather/dsc-fleet-configs](https://github.com/anwather/dsc-fleet-configs)** —
-  the actual `.dsc.yaml` documents the runner applies (Git-mode delivery).
 - **[anwather/dsc-fleet-dashboard](https://github.com/anwather/dsc-fleet-dashboard)** —
-  optional self-hostable dashboard that adds a UI, scheduling, and per-server
-  compliance reporting (Dashboard-mode delivery).
+  the self-hostable dashboard that stores configs, schedules runs, and
+  collects per-server compliance results. The runner in this repo is the
+  agent that talks to it.
 
-## Two delivery modes
+## How it works
 
-The runner (`bootstrap/Invoke-DscRunner.ps1`) supports two ways of getting
-configurations onto a server. Pick one per fleet — they don't mix on a single
-host.
-
-| Mode      | How configs arrive                                | Where state lives             | When to use                                       |
-| --------- | ------------------------------------------------- | ----------------------------- | ------------------------------------------------- |
-| Git       | `git pull` of `dsc-fleet-configs` on each cycle   | `assignments.json` in the repo | No central infra; small fleets; air-gapped scenarios |
-| Dashboard | HTTP poll of dsc-fleet-dashboard `/api/agents/*`  | Postgres in the dashboard     | UI for ops; per-server scheduling; live status     |
-
-Both modes share the same `DscV3.RegFile` module and prerequisite installer.
+1. The dashboard stores `.dsc.yaml` documents (configs) and assigns them to
+   servers.
+2. `bootstrap/Install-DscV3.ps1` lays down PowerShell 7, the DSC v3 CLI,
+   the `DscV3.RegFile` module, and the runner script on a target server.
+3. `bootstrap/Register-DashboardAgent.ps1` registers the server with the
+   dashboard (single-use provision token) and creates the SYSTEM scheduled
+   task `DscV3-Apply` that invokes the runner every minute.
+4. Each cycle the runner pulls due assignments, applies them with
+   `dsc config set`, and POSTs the result back. Pause/resume/remove all
+   happen from the dashboard UI.
 
 ## What's where
 
@@ -42,13 +41,13 @@ custom resource is shipped because nothing equivalent exists upstream:
 | ----------------------------------------------------------------- | ----------------------------------- | ------------------------------------- |
 | `DscV3.RegFile/RegFile`                                           | This repo (`modules/DscV3.RegFile`) | `Microsoft.DSC/PowerShell`            |
 | `Microsoft.WinGet.DSC/WinGetPackage`                              | PSGallery (`Microsoft.WinGet.DSC`)  | `Microsoft.DSC/PowerShell`            |
-| `PSDscResources/*` (MsiPackage, Script, …)                        | PSGallery (`PSDscResources`)        | `Microsoft.Windows/WindowsPowerShell` |
+| `PSDscResources/*` (MsiPackage, Script, ...)                      | PSGallery (`PSDscResources`)        | `Microsoft.Windows/WindowsPowerShell` |
 | `PSDesiredStateConfiguration/*` (Service, PSModule, PSRepository) | In-box PowerShell 5.1               | `Microsoft.Windows/WindowsPowerShell` |
 | `Microsoft.Windows/Registry`                                      | DSC v3 CLI (built-in)               | none                                  |
 
 Both PSGallery modules are installed by `Install-Prerequisites.ps1` to the
 AllUsers scope so they are picked up by the WindowsPowerShell adapter under
-SYSTEM. See the configs repo for ready-to-paste samples for each.
+SYSTEM.
 
 ## Supported OS
 
@@ -61,63 +60,50 @@ their official GitHub release artifacts (MSI / zip / Inno installer).
 > using `Microsoft.WinGet.DSC/WinGetPackage` will fail there — use
 > `PSDscResources/MsiPackage` instead, or filter by OS.
 
-## Onboarding — Git mode
+## Onboarding a server
 
-Run as Admin (or via `Invoke-AzVMRunCommand`) on each target server:
+Prerequisites: a running [dsc-fleet-dashboard](https://github.com/anwather/dsc-fleet-dashboard)
+instance and a target Windows Server you can reach as Admin (locally or
+via `Invoke-AzVMRunCommand`).
+
+### 1. Lay down the runtime
+
+Run as Admin on the target server:
 
 ```powershell
 .\bootstrap\Install-DscV3.ps1 `
     -PlatformRepoUrl 'https://github.com/anwather/dsc-fleet.git' `
-    -PlatformRef     'v1.0.0' `
-    -ConfigsRepoUrl  'https://github.com/anwather/dsc-fleet-configs.git' `
-    -ConfigsRef      'main'
+    -PlatformRef     'main'
 ```
 
-The bootstrap:
+This installs prerequisites (pwsh 7, dsc.exe, git, PSResourceGet,
+`Microsoft.WinGet.DSC`, `PSDscResources`), drops the `DscV3.RegFile`
+module into the AllUsers module path, and copies `Invoke-DscRunner.ps1`
+to `C:\ProgramData\DscV3\bin\`. It does **not** create the scheduled
+task — that happens in step 3 with the dashboard credentials in hand.
 
-1. Calls `Install-Prerequisites.ps1` (direct downloads of pwsh, dsc, git;
-   PSResourceGet from PSGallery; then `Microsoft.WinGet.DSC` and
-   `PSDscResources` from PSGallery to AllUsers scope).
-2. Clones this repo to `C:\ProgramData\DscV3\platform`.
-3. Installs `DscV3.RegFile` to the AllUsers module path (and removes any
-   legacy `DscV3.Discovery` install).
-4. Installs `Invoke-DscRunner.ps1` to `C:\ProgramData\DscV3\bin\`.
-5. Clones the configs repo to `C:\ProgramData\DscV3\repo`.
-6. Registers SYSTEM scheduled task `DscV3-Apply` (every 30 min, jittered,
-   running the runner in `-Mode Git`).
+### 2. Add the server in the dashboard
 
-The runner refreshes the configs repo on each cycle — to ship a config change
-you only need to push to `dsc-fleet-configs`. Platform changes require a
-re-bootstrap (intentional — slower lifecycle).
+In the dashboard UI: **Add Server** → fill subscription / resource group
+/ VM name → save → click **Provision** to receive a one-time provision
+token + the server's UUID.
 
-## Onboarding — Dashboard mode
+### 3. Register the agent
 
-First set up the dashboard following
-[anwather/dsc-fleet-dashboard](https://github.com/anwather/dsc-fleet-dashboard).
-Then on each target server:
+From an Admin shell on the target server (or via `Invoke-AzVMRunCommand`):
 
-1. Run `Install-DscV3.ps1` exactly as for Git mode (it lays down the
-   prerequisites, the module, and the runner). The Git-mode scheduled task
-   that this registers will be reconfigured in step 3.
-2. From the dashboard UI: **Add Server** → fill sub/RG/VM → save → click
-   **Provision** to receive a single-use provision token.
-3. From an Admin shell on the target server (or via `Invoke-AzVMRunCommand`):
+```powershell
+.\bootstrap\Register-DashboardAgent.ps1 `
+    -DashboardUrl    'https://dsc-fleet.example.com' `
+    -ProvisionToken  '<token from UI>' `
+    -ServerId        '<server uuid from UI>'
+```
 
-   ```powershell
-   .\bootstrap\Register-DashboardAgent.ps1 `
-       -DashboardUrl    'https://dsc-fleet.internal' `
-       -ProvisionToken  '<token from UI>' `
-       -ServerId        '<server uuid from UI>'
-   ```
-
-   This calls `POST /api/agents/register`, writes
-   `C:\ProgramData\DscV3\agent.config.json` (SYSTEM + Administrators ACL),
-   and reconfigures the `DscV3-Apply` scheduled task to invoke the runner
-   in `-Mode Dashboard`.
-
-The runner then polls the dashboard each cycle, fetches assignments,
-downloads the YAML for each one, applies it, and POSTs the result back.
-See the dashboard repo for the full wire protocol.
+This calls `POST /api/agents/register`, writes
+`C:\ProgramData\DscV3\agent.config.json` (SYSTEM + Administrators ACL),
+and creates the SYSTEM scheduled task `DscV3-Apply` that runs every
+minute. The runner then polls the dashboard, applies due assignments,
+and POSTs the results back.
 
 ## Local development
 
