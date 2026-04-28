@@ -92,6 +92,7 @@ if ($Mode -eq 'Dashboard') {
         $agentId = $cfg.AgentId
         $headers = @{ 'Authorization' = "Bearer $($cfg.AgentApiKey)"; 'Accept' = 'application/json' }
         $etagCachePath = Join-Path $StateRoot 'assignments.etag'
+        $itemsCachePath = Join-Path $StateRoot 'assignments.items.json'
         $revCacheDir   = Join-Path $StateRoot 'revisions'
         if (-not (Test-Path -LiteralPath $revCacheDir)) { New-Item -ItemType Directory -Path $revCacheDir -Force | Out-Null }
         if (-not (Test-Path -LiteralPath $RunsRoot))    { New-Item -ItemType Directory -Path $RunsRoot    -Force | Out-Null }
@@ -171,8 +172,16 @@ if ($Mode -eq 'Dashboard') {
                 return $null
             }
             if ($resp.StatusCode -eq 304) {
-                Write-RunnerLog 'assignments: 304 Not Modified'
-                return @{ NotModified = $true; Items = @() }
+                Write-RunnerLog 'assignments: 304 Not Modified (replaying cached list)'
+                $cachedItems = @()
+                if (Test-Path -LiteralPath $itemsCachePath) {
+                    try {
+                        $cachedItems = @((Get-Content -Raw -LiteralPath $itemsCachePath | ConvertFrom-Json))
+                    } catch {
+                        Write-RunnerLog -Level 'WARN' -Message "items cache unreadable: $_"
+                    }
+                }
+                return @{ NotModified = $true; Items = $cachedItems }
             }
             if ($resp.StatusCode -ne 200) {
                 Write-RunnerLog -Level 'WARN' -Message "assignments: HTTP $($resp.StatusCode)"
@@ -184,6 +193,14 @@ if ($Mode -eq 'Dashboard') {
                 $etag | Set-Content -LiteralPath $etagCachePath -Encoding UTF8 -NoNewline
             }
             $data = $resp.Content | ConvertFrom-Json
+            # Cache the items array so a subsequent 304 can still re-evaluate
+            # due-ness against the wall clock instead of skipping the cycle.
+            try {
+                $data.assignments | ConvertTo-Json -Depth 20 |
+                    Set-Content -LiteralPath $itemsCachePath -Encoding UTF8
+            } catch {
+                Write-RunnerLog -Level 'WARN' -Message "items cache write failed: $_"
+            }
             return @{ NotModified = $false; Items = @($data.assignments); ServerTime = $data.serverTime; PollSeconds = $data.pollIntervalSeconds }
         }
 
@@ -238,8 +255,13 @@ if ($Mode -eq 'Dashboard') {
             Write-RunnerLog -Level 'WARN' -Message 'no assignment payload -- exiting cycle'
             return
         }
-        if ($assignmentResp.NotModified) { return }
-        $items = $assignmentResp.Items
+        if ($assignmentResp.NotModified) {
+            $items = $assignmentResp.Items
+            if (-not $items -or $items.Count -eq 0) { return }
+            # fall through and re-evaluate due-ness against the wall clock
+        } else {
+            $items = $assignmentResp.Items
+        }
         if ($MaxAssignmentsPerCycle -gt 0 -and $items.Count -gt $MaxAssignmentsPerCycle) {
             $items = $items[0..($MaxAssignmentsPerCycle - 1)]
         }
