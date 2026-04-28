@@ -137,7 +137,7 @@ if ($Mode -eq 'Dashboard') {
                 try {
                     $rows = Get-Module -ListAvailable | Group-Object Name | ForEach-Object { $_.Group | Sort-Object Version -Descending | Select-Object -First 1 }
                     foreach ($r in $rows) { $out += @{ name = $r.Name; version = $r.Version.ToString() } }
-                } catch { }
+                } catch { Write-RunnerLog -Level 'DEBUG' -Message "module list fallback failed: $_" }
             }
             # Dedup by name.
             $hash = @{}
@@ -147,15 +147,17 @@ if ($Mode -eq 'Dashboard') {
 
         function Send-Heartbeat {
             $os = $null
-            try { $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop } catch { }
+            try { $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop } catch { Write-RunnerLog -Level 'DEBUG' -Message "Win32_OperatingSystem query failed: $_" }
             $dscVer = $null
-            try { $dscVer = (& $dsc --version 2>&1 | Out-String).Trim() } catch { }
+            try { $dscVer = (& $dsc --version 2>&1 | Out-String).Trim() } catch { Write-RunnerLog -Level 'DEBUG' -Message "dsc --version failed: $_" }
+            $mods = @(Get-InstalledModuleList)
+            if ($null -eq $mods) { $mods = @() }
             $body = @{
                 osCaption    = ${os}?.Caption
                 osVersion    = ${os}?.Version
                 dscExeVersion = $dscVer
                 agentVersion = '0.1.0-dashboard'
-                modules      = Get-InstalledModuleList
+                modules      = [object[]]$mods
                 serverTime   = (Get-Date).ToUniversalTime().ToString('o')
             }
             try {
@@ -166,7 +168,7 @@ if ($Mode -eq 'Dashboard') {
             }
         }
 
-        function Get-Assignments {
+        function Get-AssignmentList {
             $h = @{}
             if (Test-Path -LiteralPath $etagCachePath) {
                 $h['If-None-Match'] = (Get-Content -Raw -LiteralPath $etagCachePath).Trim()
@@ -241,7 +243,7 @@ if ($Mode -eq 'Dashboard') {
 
         # --- Cycle ----------------------------------------------------------
         Send-Heartbeat
-        $assignmentResp = Get-Assignments
+        $assignmentResp = Get-AssignmentList
         if ($null -eq $assignmentResp) {
             Write-RunnerLog -Level 'WARN' -Message 'no assignment payload — exiting cycle'
             return
