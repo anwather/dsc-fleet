@@ -132,7 +132,31 @@ Set-Acl -LiteralPath $AgentConfig -AclObject $acl
 # --- 3. Re-register scheduled task with -Mode Dashboard ---------------------
 Write-Step 'Reconfiguring scheduled task DscV3-Apply for dashboard mode'
 $taskName = 'DscV3-Apply'
-$pwshPath = (Get-Command pwsh).Source
+
+# Resolve pwsh.exe with fallback. Get-Command works once pwsh is on PATH,
+# but during fresh provisioning (Run-Command session) the parent process'
+# PATH was captured before Install-Prerequisites added pwsh, so we have to
+# probe well-known install locations as a fallback.
+$pwshPath = $null
+$cmd = Get-Command pwsh -ErrorAction SilentlyContinue
+if ($cmd) {
+    $pwshPath = $cmd.Source
+} else {
+    foreach ($candidate in @(
+        "$env:ProgramFiles\PowerShell\7\pwsh.exe",
+        "${env:ProgramFiles(x86)}\PowerShell\7\pwsh.exe",
+        "$env:ProgramFiles\PowerShell\7-preview\pwsh.exe"
+    )) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate)) {
+            $pwshPath = $candidate
+            break
+        }
+    }
+}
+if (-not $pwshPath) {
+    throw "Could not locate pwsh.exe. Install-Prerequisites.ps1 should have placed it at '$env:ProgramFiles\PowerShell\7\pwsh.exe'."
+}
+Write-Host "    pwsh: $pwshPath"
 
 $argList = @(
     '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
