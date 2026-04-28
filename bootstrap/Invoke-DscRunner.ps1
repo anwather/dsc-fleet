@@ -118,21 +118,33 @@ if ($Mode -eq 'Dashboard') {
         }
 
         function Get-InstalledModuleList {
-            $out = @()
+            $hash = [ordered]@{}
+            # Source 1: PSResourceGet (preferred, has scope info)
             try {
                 Import-Module Microsoft.PowerShell.PSResourceGet -ErrorAction Stop
-                $rows = Get-InstalledPSResource -Scope AllUsers -ErrorAction SilentlyContinue
-                foreach ($r in $rows) { $out += @{ name = $r.Name; version = $r.Version.ToString() } }
-            } catch {
-                # Best-effort fallback to PowerShellGet v2.
-                try {
-                    $rows = Get-Module -ListAvailable | Group-Object Name | ForEach-Object { $_.Group | Sort-Object Version -Descending | Select-Object -First 1 }
-                    foreach ($r in $rows) { $out += @{ name = $r.Name; version = $r.Version.ToString() } }
-                } catch { Write-RunnerLog -Level 'DEBUG' -Message "module list fallback failed: $_" }
-            }
-            # Dedup by name.
-            $hash = @{}
-            foreach ($m in $out) { if (-not $hash.ContainsKey($m.name)) { $hash[$m.name] = $m } }
+                foreach ($scope in 'AllUsers','CurrentUser') {
+                    try {
+                        $rows = Get-InstalledPSResource -Scope $scope -ErrorAction SilentlyContinue
+                        foreach ($r in $rows) {
+                            if ($r.Name -and -not $hash.Contains($r.Name)) {
+                                $hash[$r.Name] = @{ name = $r.Name; version = $r.Version.ToString() }
+                            }
+                        }
+                    } catch { Write-RunnerLog -Level 'DEBUG' -Message "Get-InstalledPSResource $scope failed: $_" }
+                }
+            } catch { Write-RunnerLog -Level 'DEBUG' -Message "PSResourceGet import failed: $_" }
+            # Source 2: Get-Module -ListAvailable -- belt-and-suspenders, picks up
+            # modules dropped into $env:PSModulePath that PSResourceGet doesn't index.
+            try {
+                $rows = Get-Module -ListAvailable -ErrorAction SilentlyContinue |
+                    Group-Object Name |
+                    ForEach-Object { $_.Group | Sort-Object Version -Descending | Select-Object -First 1 }
+                foreach ($r in $rows) {
+                    if ($r.Name -and -not $hash.Contains($r.Name)) {
+                        $hash[$r.Name] = @{ name = $r.Name; version = $r.Version.ToString() }
+                    }
+                }
+            } catch { Write-RunnerLog -Level 'DEBUG' -Message "Get-Module -ListAvailable failed: $_" }
             return @($hash.Values)
         }
 
@@ -153,7 +165,7 @@ if ($Mode -eq 'Dashboard') {
             }
             try {
                 $resp = Invoke-Dashboard -Method POST -Path "/api/agents/$agentId/heartbeat" -Body $body
-                Write-RunnerLog "heartbeat ok (server time $($resp.serverTime), poll $($resp.pollIntervalSeconds)s)"
+                Write-RunnerLog "heartbeat ok ($($mods.Count) module(s) reported, server time $($resp.serverTime), poll $($resp.pollIntervalSeconds)s)"
             } catch {
                 Write-RunnerLog -Level 'WARN' -Message "heartbeat failed: $_"
             }
@@ -330,12 +342,14 @@ if ($Mode -eq 'Dashboard') {
                         $reqMods = @($a.requiredModules)
                     }
                     if ($reqMods.Count -gt 0) {
-                        Write-RunnerLog "prereq=$($a.prereqStatus) for $($a.assignmentId) -- attempting local install of $($reqMods.Count) module(s)"
-                        $changed = Install-RequiredModules -Required $reqMods
-                        if ($changed) {
-                            Write-RunnerLog 're-sending heartbeat after module install so dashboard can reconcile prereq'
-                            Send-Heartbeat
-                        }
+                        Write-RunnerLog "prereq=$($a.prereqStatus) for $($a.assignmentId) -- ensuring $($reqMods.Count) module(s) installed"
+                        Install-RequiredModules -Required $reqMods | Out-Null
+                        # Always re-heartbeat so the dashboard sees the latest module
+                        # list and reconciles prereq even if the module was already
+                        # present locally (heartbeat is the only place server_modules
+                        # is updated).
+                        Write-RunnerLog 're-sending heartbeat so dashboard can reconcile prereq'
+                        Send-Heartbeat
                     } else {
                         Write-RunnerLog "skip $($a.assignmentId): prereq=$($a.prereqStatus)"
                     }
