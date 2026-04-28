@@ -229,6 +229,55 @@ if ($Mode -eq 'Dashboard') {
             return @{ ExitCode = $LASTEXITCODE; Output = $output }
         }
 
+        function Test-ModuleInstalled {
+            param([string] $Name, [string] $MinVersion)
+            try {
+                $candidates = Get-Module -ListAvailable -Name $Name -ErrorAction SilentlyContinue
+                if (-not $candidates) { return $false }
+                if ([string]::IsNullOrWhiteSpace($MinVersion)) { return $true }
+                $min = [version]$MinVersion
+                foreach ($c in $candidates) { if (([version]$c.Version) -ge $min) { return $true } }
+                return $false
+            } catch { return $false }
+        }
+
+        function Install-RequiredModules {
+            param([object[]] $Required)
+            if (-not $Required -or $Required.Count -eq 0) { return $false }
+            $installed = $false
+            try {
+                if (-not (Get-Module -ListAvailable -Name Microsoft.PowerShell.PSResourceGet)) {
+                    Write-RunnerLog 'installing PSResourceGet (prereq for module installs)'
+                    Install-Module Microsoft.PowerShell.PSResourceGet -Scope AllUsers -Force -AllowClobber -ErrorAction Stop
+                }
+                Import-Module Microsoft.PowerShell.PSResourceGet -Force -ErrorAction Stop
+                if (-not (Get-PSResourceRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+                    Register-PSResourceRepository -PSGallery -Trusted -ErrorAction SilentlyContinue
+                } else {
+                    Set-PSResourceRepository -Name PSGallery -Trusted -ErrorAction SilentlyContinue
+                }
+            } catch {
+                Write-RunnerLog -Level 'WARN' -Message "PSResourceGet bootstrap failed: $_"
+                return $false
+            }
+            foreach ($m in $Required) {
+                $name = $m.name
+                $minV = $null
+                if ($m.PSObject.Properties.Name -contains 'minVersion') { $minV = $m.minVersion }
+                if (Test-ModuleInstalled -Name $name -MinVersion $minV) { continue }
+                try {
+                    $args = @{ Name = $name; Scope = 'AllUsers'; TrustRepository = $true; AcceptLicense = $true; ErrorAction = 'Stop' }
+                    if (-not [string]::IsNullOrWhiteSpace($minV)) { $args.Version = $minV }
+                    Write-RunnerLog "install module $name$(if ($minV) { " v$minV" })"
+                    Install-PSResource @args
+                    $installed = $true
+                } catch {
+                    Write-RunnerLog -Level 'WARN' -Message "install $name failed: $_"
+                }
+            }
+            return $installed
+        }
+
         function Send-RunResult {
             param([hashtable] $Body)
             try {
@@ -276,7 +325,20 @@ if ($Mode -eq 'Dashboard') {
                 }
                 if ($a.lifecycleState -ne 'active') { continue }
                 if ($a.prereqStatus -ne 'ready') {
-                    Write-RunnerLog "skip $($a.assignmentId): prereq=$($a.prereqStatus)"
+                    $reqMods = @()
+                    if ($a.PSObject.Properties.Name -contains 'requiredModules' -and $a.requiredModules) {
+                        $reqMods = @($a.requiredModules)
+                    }
+                    if ($reqMods.Count -gt 0) {
+                        Write-RunnerLog "prereq=$($a.prereqStatus) for $($a.assignmentId) -- attempting local install of $($reqMods.Count) module(s)"
+                        $changed = Install-RequiredModules -Required $reqMods
+                        if ($changed) {
+                            Write-RunnerLog 're-sending heartbeat after module install so dashboard can reconcile prereq'
+                            Send-Heartbeat
+                        }
+                    } else {
+                        Write-RunnerLog "skip $($a.assignmentId): prereq=$($a.prereqStatus)"
+                    }
                     continue
                 }
                 if (-not $a.revisionId) {
