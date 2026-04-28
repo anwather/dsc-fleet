@@ -54,6 +54,15 @@
     (no password; Windows fetches it from AD). Requires the VM to be domain
     joined and the gMSA installed via Install-ADServiceAccount.
 
+.PARAMETER CredentialUrl
+    One-time URL emitted by the dashboard from which to fetch run-as
+    credentials. When set, the script POSTs to this URL with
+    `Authorization: Bearer $ProvisionToken`. The response is
+    `{ username, kind, password? }`. The URL is single-use and short-lived;
+    the dashboard scrubs the encrypted material from its database after
+    the call. If both -CredentialUrl and inline -RunAsUser/-RunAsPassword
+    are supplied, -CredentialUrl wins.
+
 .PARAMETER Force
     Overwrite an existing agent.config.json.
 #>
@@ -67,6 +76,7 @@ param(
     [string]       $RunAsUser            = '',
     [SecureString] $RunAsPassword,
     [switch]       $RunAsGmsa,
+    [string]       $CredentialUrl        = '',
     [switch]       $Force
 )
 
@@ -173,6 +183,44 @@ $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGo
                 -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
 
 # --- 3a. Resolve run-as identity --------------------------------------------
+# When -CredentialUrl is supplied, fetch credentials from the dashboard before
+# proceeding. The URL is single-use and authenticated by the provision token;
+# the dashboard scrubs ciphertext after a successful read.
+if ($CredentialUrl) {
+    Write-Step "fetching run-as credentials from dashboard"
+    try {
+        $headers = @{ Authorization = "Bearer $ProvisionToken" }
+        $resp    = Invoke-RestMethod -Method Post -Uri $CredentialUrl -Headers $headers `
+                       -ContentType 'application/json' -Body '{}' -ErrorAction Stop
+    }
+    catch {
+        throw "Failed to fetch run-as credentials from dashboard: $($_.Exception.Message)"
+    }
+    if (-not $resp.username -or -not $resp.kind) {
+        throw "Run-as credential response missing required fields (username, kind)."
+    }
+    $RunAsUser = [string]$resp.username
+    if ($resp.kind -eq 'gmsa') {
+        $RunAsGmsa = [switch]::Present
+        $RunAsPassword = $null
+    }
+    elseif ($resp.kind -eq 'password') {
+        if (-not $resp.password) {
+            throw "Run-as credential response of kind 'password' is missing the password field."
+        }
+        # Convert plaintext to SecureString and immediately drop the plaintext
+        # variable from view. PowerShell will GC it shortly; the SecureString
+        # path is the persistent representation.
+        $secure = ConvertTo-SecureString -String ([string]$resp.password) -AsPlainText -Force
+        $RunAsPassword = $secure
+        Remove-Variable -Name resp -ErrorAction SilentlyContinue
+    }
+    else {
+        throw "Unknown run-as credential kind: '$($resp.kind)'"
+    }
+    Write-Host "    fetched run-as kind=$RunAsUser($($RunAsGmsa.IsPresent))"
+}
+
 $builtIn = @('NT AUTHORITY\SYSTEM','SYSTEM','NT AUTHORITY\NetworkService','NetworkService','NT AUTHORITY\LocalService','LocalService')
 $normalisedRunAs = if ($RunAsUser) { $RunAsUser.Trim() } else { '' }
 $useSystem      = (-not $normalisedRunAs) -or ($normalisedRunAs -in $builtIn)
