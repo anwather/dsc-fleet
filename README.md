@@ -15,8 +15,10 @@ The **platform** repo for managing DSC v3 across a fleet of Windows Servers
 2. `bootstrap/Install-DscV3.ps1` lays down PowerShell 7, the DSC v3 CLI,
    the `DscV3.RegFile` module, and the runner script on a target server.
 3. `bootstrap/Register-DashboardAgent.ps1` registers the server with the
-   dashboard (single-use provision token) and creates the SYSTEM scheduled
-   task `DscV3-Apply` that invokes the runner every minute.
+   dashboard (single-use provision token) and creates the scheduled
+   task `DscV3-Apply` that invokes the runner every minute. Default
+   identity is `SYSTEM`; can be switched to a local/domain account or
+   gMSA — see [Run-as identity](#run-as-identity-optional).
 4. Each cycle the runner pulls due assignments, applies them with
    `dsc config set`, and POSTs the result back. Pause/resume/remove all
    happen from the dashboard UI.
@@ -101,9 +103,88 @@ From an Admin shell on the target server (or via `Invoke-AzVMRunCommand`):
 
 This calls `POST /api/agents/register`, writes
 `C:\ProgramData\DscV3\agent.config.json` (SYSTEM + Administrators ACL),
-and creates the SYSTEM scheduled task `DscV3-Apply` that runs every
-minute. The runner then polls the dashboard, applies due assignments,
-and POSTs the results back.
+and creates the scheduled task `DscV3-Apply` that runs every minute.
+By default the task runs as `NT AUTHORITY\SYSTEM`. The runner then polls
+the dashboard, applies due assignments, and POSTs the results back.
+
+### Run-as identity (optional)
+
+The default `SYSTEM` identity is fine for most scenarios. For workloads
+where SYSTEM is brittle (notably winget package installs — winget under
+SYSTEM cannot enumerate user-scope installs and fails on archive extract
+in some package shapes), the agent task can run under a different
+identity:
+
+| Identity         | When                                        | Storage                      |
+| ---------------- | ------------------------------------------- | ---------------------------- |
+| `SYSTEM`         | Default. Most resource types, no AD.        | n/a                          |
+| Local admin acct | winget installs, MSI/EXE that need profile. | LSA secret store (machine)   |
+| Domain user      | Domain-joined, simple network access.       | LSA secret store (machine)   |
+| **gMSA**         | **Recommended for domain-joined boxes.**    | AD-managed (rotated by KDS)  |
+
+The run-as identity **must be a local Administrator** on the VM — the
+runner installs PowerShell modules under `Program Files`, restarts
+services, writes `HKLM`, etc.
+
+#### Set the identity at provision time
+
+`Register-DashboardAgent.ps1` accepts run-as parameters. Run on the
+target box (after `Install-DscV3.ps1`):
+
+```powershell
+# Local or domain user (you'll be prompted for the password securely)
+$pw = Read-Host 'Password' -AsSecureString
+.\bootstrap\Register-DashboardAgent.ps1 `
+    -DashboardUrl   'https://dsc-fleet.example.com' `
+    -ProvisionToken '<token>' `
+    -RunAsUser      'CONTOSO\dscagent' `
+    -RunAsPassword  $pw
+
+# gMSA (no password)
+.\bootstrap\Register-DashboardAgent.ps1 `
+    -DashboardUrl   'https://dsc-fleet.example.com' `
+    -ProvisionToken '<token>' `
+    -RunAsUser      'CONTOSO\dscgmsa$' `
+    -RunAsGmsa
+```
+
+The plaintext is materialized only at the `Register-ScheduledTask`
+call, then the BSTR is zeroed. Windows stores the credential as an LSA
+secret on the local machine (DPAPI-protected with a machine-bound
+master key). The dashboard never sees the password.
+
+#### Change the identity after provisioning
+
+Use the retrofit helper. Runs locally; nothing transits the network:
+
+```powershell
+# Switch to a service account
+.\bootstrap\Set-DscFleetRunAsAccount.ps1 -Credential (Get-Credential .\dscagent)
+
+# Switch to a gMSA
+.\bootstrap\Set-DscFleetRunAsAccount.ps1 -RunAsUser 'CONTOSO\dscgmsa$' -Gmsa
+
+# Revert to SYSTEM
+.\bootstrap\Set-DscFleetRunAsAccount.ps1 -SystemAccount
+```
+
+#### Caveats
+
+- **Run-Command leakage:** if you push run-as creds via the dashboard's
+  Azure Run-Command provision flow, the credentials are interpolated
+  into the script content which Azure persists in the VM instance view
+  for ~7 days. Prefer `Set-DscFleetRunAsAccount.ps1` post-provision when
+  the security model matters.
+- **LSA recoverable by local SYSTEM:** Task Scheduler-stored passwords
+  are protected, not invulnerable. They can be retrieved by anyone with
+  SYSTEM/local-admin and LSASS access. gMSA eliminates this.
+- **`Log on as a batch job`:** the run-as account needs
+  `SeBatchLogonRight`. Local administrators have it by default; domain
+  GPO can deny it. If the task fails to start with `0x80070534`, that's
+  the reason.
+- **gMSA prerequisites:** VM must be domain-joined; KDS root key must
+  exist; `Test-ADServiceAccount <name>` should return `True` on the VM
+  before registering the task.
 
 ## Local development
 

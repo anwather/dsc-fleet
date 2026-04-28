@@ -31,6 +31,29 @@
 .PARAMETER ScheduleEverySeconds
     How often the agent polls. Default 60.
 
+.PARAMETER RunAsUser
+    Optional. Identity the DscV3-Apply scheduled task should run under.
+    Examples:
+        ''                       (default) -> NT AUTHORITY\SYSTEM
+        'NT AUTHORITY\SYSTEM'    SYSTEM (explicit)
+        '.\dscagent'             local Administrator account
+        'CONTOSO\dscagent'       domain user
+        'CONTOSO\dscgmsa$'       group Managed Service Account (also pass -RunAsGmsa)
+    The account MUST be a member of local Administrators (the runner installs
+    PS modules under Program Files, restarts services, writes HKLM, etc.).
+
+.PARAMETER RunAsPassword
+    SecureString. Required when -RunAsUser is set to a regular account
+    (not SYSTEM, NetworkService, LocalService, or a gMSA).
+    The plaintext is materialized only at the moment Register-ScheduledTask
+    is called, then zeroed. Windows stores the credential as an LSA secret
+    on this machine -- DPAPI-protected with a machine-bound master key.
+
+.PARAMETER RunAsGmsa
+    Switch. Indicates -RunAsUser refers to a group Managed Service Account
+    (no password; Windows fetches it from AD). Requires the VM to be domain
+    joined and the gMSA installed via Install-ADServiceAccount.
+
 .PARAMETER Force
     Overwrite an existing agent.config.json.
 #>
@@ -38,10 +61,13 @@
 param(
     [Parameter(Mandatory)] [string] $DashboardUrl,
     [Parameter(Mandatory)] [string] $ProvisionToken,
-    [string] $AgentConfig          = 'C:\ProgramData\DscV3\agent.config.json',
-    [string] $RunnerScript         = 'C:\ProgramData\DscV3\bin\Invoke-DscRunner.ps1',
-    [int]    $ScheduleEverySeconds = 60,
-    [switch] $Force
+    [string]       $AgentConfig          = 'C:\ProgramData\DscV3\agent.config.json',
+    [string]       $RunnerScript         = 'C:\ProgramData\DscV3\bin\Invoke-DscRunner.ps1',
+    [int]          $ScheduleEverySeconds = 60,
+    [string]       $RunAsUser            = '',
+    [SecureString] $RunAsPassword,
+    [switch]       $RunAsGmsa,
+    [switch]       $Force
 )
 
 $ErrorActionPreference = 'Stop'
@@ -118,16 +144,82 @@ $argList = @(
 $action    = New-ScheduledTaskAction -Execute $pwshPath -Argument $argList
 $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddMinutes(1) `
                 -RepetitionInterval (New-TimeSpan -Seconds $ScheduleEverySeconds)
-$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                 -StartWhenAvailable -MultipleInstances IgnoreNew `
                 -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
 
+# --- 3a. Resolve run-as identity --------------------------------------------
+$builtIn = @('NT AUTHORITY\SYSTEM','SYSTEM','NT AUTHORITY\NetworkService','NetworkService','NT AUTHORITY\LocalService','LocalService')
+$normalisedRunAs = if ($RunAsUser) { $RunAsUser.Trim() } else { '' }
+$useSystem      = (-not $normalisedRunAs) -or ($normalisedRunAs -in $builtIn)
+$useGmsa        = -not $useSystem -and $RunAsGmsa.IsPresent
+$usePasswordAcct = -not $useSystem -and -not $useGmsa
+
+if ($usePasswordAcct -and -not $RunAsPassword) {
+    throw "RunAsPassword (SecureString) is required when -RunAsUser ('$normalisedRunAs') is a regular account. Pass -RunAsGmsa for a group Managed Service Account."
+}
+if ($useGmsa -and -not $normalisedRunAs.EndsWith('$')) {
+    Write-Warning "RunAsGmsa specified but '$normalisedRunAs' does not end with '$' -- gMSAs are typically of the form DOMAIN\name$"
+}
+
 if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
 }
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
-    -Principal $principal -Settings $settings -Force | Out-Null
+
+if ($useSystem) {
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+        -Principal $principal -Settings $settings -Force | Out-Null
+    Write-Host "    run as: NT AUTHORITY\SYSTEM"
+}
+elseif ($useGmsa) {
+    $principal = New-ScheduledTaskPrincipal -UserId $normalisedRunAs -LogonType Password -RunLevel Highest
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+        -Principal $principal -Settings $settings -Force | Out-Null
+    Write-Host "    run as: $normalisedRunAs (gMSA)"
+}
+else {
+    # Regular password-backed account. Materialize the plaintext only inside try/finally.
+    $bstr  = [IntPtr]::Zero
+    $plain = $null
+    try {
+        $bstr  = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($RunAsPassword)
+        $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+            -Settings $settings -User $normalisedRunAs -Password $plain `
+            -RunLevel Highest -Force | Out-Null
+    }
+    finally {
+        if ($bstr -ne [IntPtr]::Zero) {
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        }
+        $plain = $null
+    }
+    Write-Host "    run as: $normalisedRunAs (password-backed; credential held in LSA secret store)"
+}
+
+# --- 3b. Verify RunLevel Highest survived registration ----------------------
+$registered = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+if ($registered.Principal.RunLevel -ne 'Highest') {
+    throw "Registered task DscV3-Apply has RunLevel '$($registered.Principal.RunLevel)' -- expected 'Highest'. Registration was rejected."
+}
+
+# --- 3c. Grant the run-as account read access to agent.config.json ----------
+# (already SYSTEM + Administrators FullControl; if the account is a local admin
+# this is a no-op, but explicit ACE keeps it working if admin membership ever
+# changes.)
+if ($usePasswordAcct -or $useGmsa) {
+    try {
+        $acl2 = Get-Acl -LiteralPath $AgentConfig
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($normalisedRunAs, 'Read', 'Allow')
+        $acl2.AddAccessRule($rule)
+        Set-Acl -LiteralPath $AgentConfig -AclObject $acl2
+        Write-Host "    granted Read on $AgentConfig to $normalisedRunAs"
+    } catch {
+        Write-Warning "Could not grant Read ACL on $AgentConfig to ${normalisedRunAs}: $_"
+        Write-Warning 'Ensure the run-as account is a member of local Administrators (required for the runner regardless).'
+    }
+}
 
 # --- 4. Initial heartbeat to flip server.status -> ready --------------------
 Write-Step 'Sending initial heartbeat'
