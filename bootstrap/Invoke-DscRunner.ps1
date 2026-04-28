@@ -151,8 +151,8 @@ if ($Mode -eq 'Dashboard') {
             $dscVer = $null
             try { $dscVer = (& $dsc --version 2>&1 | Out-String).Trim() } catch { }
             $body = @{
-                osCaption    = $os?.Caption
-                osVersion    = $os?.Version
+                osCaption    = ${os}?.Caption
+                osVersion    = ${os}?.Version
                 dscExeVersion = $dscVer
                 agentVersion = '0.1.0-dashboard'
                 modules      = Get-InstalledModuleList
