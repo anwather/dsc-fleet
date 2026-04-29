@@ -195,15 +195,59 @@ class RegFile {
             return @{ Key = $key; Name = $name; Type = 'QWord'; Value = [long][Convert]::ToUInt64($hex, 16) }
         }
         if ($right.StartsWith('hex')) {
-            # hex(<n>):aa,bb,cc — n=2 expand_sz, 7 multi_sz, 0/1 binary/sz, 4 dword(BE).
-            # For Test purposes we only compare the raw byte sequence.
+            # hex(<n>):aa,bb,cc — n: 0=binary, 1=sz(binary form), 2=expand_sz,
+            # 4=dword(BE), 7=multi_sz, b=qword. Decode the byte stream first,
+            # then upcast to the typed value the registry actually stores so
+            # comparison against `Get-ItemProperty` returns matching primitives.
             $colon = $right.IndexOf(':')
-            $bytes = ($right.Substring($colon + 1) -split ',') |
-                     Where-Object { $_ -match '^[0-9A-Fa-f]+$' } |
-                     ForEach-Object { [byte][Convert]::ToInt32($_, 16) }
-            return @{ Key = $key; Name = $name; Type = 'Binary'; Value = [byte[]]$bytes }
+            $bytes = [byte[]](
+                ($right.Substring($colon + 1) -split ',') |
+                    Where-Object { $_ -match '^[0-9A-Fa-f]+$' } |
+                    ForEach-Object { [byte][Convert]::ToInt32($_, 16) }
+            )
+            $hexType = $null
+            if ($right.StartsWith('hex(')) {
+                $rp = $right.IndexOf(')')
+                if ($rp -gt 4) { $hexType = $right.Substring(4, $rp - 4).ToLowerInvariant() }
+            }
+            switch ($hexType) {
+                'b' {
+                    if ($bytes.Length -ne 8) {
+                        # Malformed REG_QWORD — fall back to raw bytes so we at
+                        # least don't throw at parse time.
+                        return @{ Key = $key; Name = $name; Type = 'Binary'; Value = $bytes }
+                    }
+                    return @{ Key = $key; Name = $name; Type = 'QWord'; Value = [long][System.BitConverter]::ToInt64($bytes, 0) }
+                }
+                '2' {
+                    return @{ Key = $key; Name = $name; Type = 'ExpandString'; Value = [RegFile]::DecodeUtf16Sz($bytes) }
+                }
+                '7' {
+                    return @{ Key = $key; Name = $name; Type = 'MultiString'; Value = [RegFile]::DecodeUtf16MultiSz($bytes) }
+                }
+                default {
+                    return @{ Key = $key; Name = $name; Type = 'Binary'; Value = $bytes }
+                }
+            }
         }
         return $null
+    }
+
+    # Decode a REG_EXPAND_SZ byte stream (UTF-16 LE, single null-terminated).
+    static [string] DecodeUtf16Sz([byte[]] $bytes) {
+        if ($null -eq $bytes -or $bytes.Length -eq 0) { return '' }
+        $s = [System.Text.Encoding]::Unicode.GetString($bytes)
+        # Strip the trailing U+0000 terminator if present.
+        return $s.TrimEnd([char]0)
+    }
+
+    # Decode a REG_MULTI_SZ byte stream (UTF-16 LE, NUL-separated, NUL NUL terminator).
+    static [string[]] DecodeUtf16MultiSz([byte[]] $bytes) {
+        if ($null -eq $bytes -or $bytes.Length -eq 0) { return [string[]]@() }
+        $s = [System.Text.Encoding]::Unicode.GetString($bytes)
+        $s = $s.TrimEnd([char]0)
+        if ($s.Length -eq 0) { return [string[]]@() }
+        return [string[]]$s.Split([char]0)
     }
 
     static [bool] RegistryValueExists([hashtable] $entry) {
@@ -231,6 +275,24 @@ class RegFile {
             'String' { return [string]$current -eq [string]$entry.Value }
             'DWord'  { return [int]$current   -eq [int]$entry.Value }
             'QWord'  { return [long]$current  -eq [long]$entry.Value }
+            'ExpandString' {
+                # Get-ItemProperty auto-expands REG_EXPAND_SZ; re-read the raw
+                # unexpanded form via .NET so we compare what's actually stored
+                # rather than the expanded result, which would never match a
+                # literal `%TEMP%` from the .reg.
+                $raw = [RegFile]::ReadRawString($entry.Key, $valueName)
+                if ($null -eq $raw) { return [string]$current -eq [string]$entry.Value }
+                return [string]$raw -eq [string]$entry.Value
+            }
+            'MultiString' {
+                $expected = @($entry.Value)
+                $actual   = @($current)
+                if ($expected.Count -ne $actual.Count) { return $false }
+                for ($i = 0; $i -lt $expected.Count; $i++) {
+                    if ([string]$actual[$i] -ne [string]$expected[$i]) { return $false }
+                }
+                return $true
+            }
             'Binary' {
                 $a = [byte[]]$current; $b = [byte[]]$entry.Value
                 if ($a.Length -ne $b.Length) { return $false }
@@ -241,5 +303,36 @@ class RegFile {
             }
         }
         return $false
+    }
+
+    # Read a REG_EXPAND_SZ value WITHOUT expanding env vars. Returns $null if
+    # the API call fails so the caller can fall back to the expanded form.
+    static [string] ReadRawString([string] $regKey, [string] $valueName) {
+        $parts = $regKey -split '\\', 2
+        $hiveName = $parts[0]
+        $sub      = if ($parts.Count -eq 2) { $parts[1] } else { '' }
+        $hiveEnum = switch ($hiveName) {
+            'HKEY_LOCAL_MACHINE'  { [Microsoft.Win32.RegistryHive]::LocalMachine }
+            'HKEY_CURRENT_USER'   { [Microsoft.Win32.RegistryHive]::CurrentUser }
+            'HKEY_CLASSES_ROOT'   { [Microsoft.Win32.RegistryHive]::ClassesRoot }
+            'HKEY_USERS'          { [Microsoft.Win32.RegistryHive]::Users }
+            'HKEY_CURRENT_CONFIG' { [Microsoft.Win32.RegistryHive]::CurrentConfig }
+            default               { return $null }
+        }
+        try {
+            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hiveEnum, [Microsoft.Win32.RegistryView]::Default)
+            try {
+                $sk = $base.OpenSubKey($sub, $false)
+                if ($null -eq $sk) { return $null }
+                try {
+                    $name = if ([string]::IsNullOrEmpty($valueName) -or $valueName -eq '(default)') { '' } else { $valueName }
+                    $val  = $sk.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                    if ($null -eq $val) { return $null }
+                    return [string]$val
+                } finally { $sk.Dispose() }
+            } finally { $base.Dispose() }
+        } catch {
+            return $null
+        }
     }
 }
