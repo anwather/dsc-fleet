@@ -57,6 +57,10 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3.0
 
+# Unified log sink shared with prereq, register, runner, run-as, removal scripts.
+$loggingModule = Join-Path $PSScriptRoot 'DscFleet.Logging.psm1'
+if (Test-Path -LiteralPath $loggingModule) { Import-Module $loggingModule -Force }
+
 $root = 'C:\ProgramData\DscV3'
 $paths = @{
     Root  = $root
@@ -68,7 +72,13 @@ $paths = @{
 # deleted before the script returns. Never persists across runs.
 $platformWork = Join-Path ([System.IO.Path]::GetTempPath()) ("dsc-fleet-install-" + [guid]::NewGuid().ToString('N'))
 
-function Write-Step([string] $message) { Write-Host "==> $message" -ForegroundColor Cyan }
+function Write-Step([string] $message) {
+    if (Get-Command Write-DscFleetLog -ErrorAction SilentlyContinue) {
+        Write-DscFleetLog -Component 'Install' -Level 'INFO' -Message ('==> ' + $message)
+    } else {
+        Write-Host ('==> ' + $message) -ForegroundColor Cyan
+    }
+}
 
 function Add-TokenToUrl([string] $url, [string] $token) {
     if (-not $token) { return $url }
@@ -182,6 +192,19 @@ try {
     if (-not (Test-Path -LiteralPath $runnerSrc)) { throw "Runner source missing: $runnerSrc" }
     if ($PSCmdlet.ShouldProcess($runnerDst, 'Copy runner')) {
         Copy-Item -LiteralPath $runnerSrc -Destination $runnerDst -Force
+    }
+
+    # Copy the unified-logging module next to the runner so the SYSTEM-context
+    # scheduled task can Import-Module from $PSScriptRoot. Without this every
+    # heartbeat would fall back to host-only logging and never reach agent.log.
+    $loggingSrc = Join-Path $platformWork 'bootstrap\DscFleet.Logging.psm1'
+    $loggingDst = Join-Path $paths.Bin     'DscFleet.Logging.psm1'
+    if (Test-Path -LiteralPath $loggingSrc) {
+        if ($PSCmdlet.ShouldProcess($loggingDst, 'Copy DscFleet.Logging module')) {
+            Copy-Item -LiteralPath $loggingSrc -Destination $loggingDst -Force
+        }
+    } else {
+        Write-Step "WARN: DscFleet.Logging.psm1 missing from clone -- runner will fall back to host-only logging"
     }
 
     $cache = "$env:LOCALAPPDATA\dsc\PSAdapterCache.json"

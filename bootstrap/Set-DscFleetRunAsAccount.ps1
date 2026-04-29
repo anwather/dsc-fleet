@@ -81,7 +81,24 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3.0
 
-function Write-Step([string] $m) { Write-Host "==> $m" -ForegroundColor Cyan }
+$loggingModule = Join-Path $PSScriptRoot 'DscFleet.Logging.psm1'
+if (Test-Path -LiteralPath $loggingModule) { Import-Module $loggingModule -Force }
+
+function Write-Step([string] $m) {
+    if (Get-Command Write-DscFleetLog -ErrorAction SilentlyContinue) {
+        Write-DscFleetLog -Component 'RunAs' -Level 'INFO' -Message ('==> ' + $m)
+    } else {
+        Write-Host ('==> ' + $m) -ForegroundColor Cyan
+    }
+}
+
+function Write-RunAsInfo([string] $m, [string] $Level = 'INFO') {
+    if (Get-Command Write-DscFleetLog -ErrorAction SilentlyContinue) {
+        Write-DscFleetLog -Component 'RunAs' -Level $Level -Message ('    ' + $m)
+    } else {
+        if ($Level -eq 'WARN') { Write-Warning $m } else { Write-Host ('    ' + $m) }
+    }
+}
 
 # --- Validate task exists ---------------------------------------------------
 $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -99,7 +116,7 @@ switch ($PSCmdlet.ParameterSetName) {
         $newUser     = $RunAsUser.Trim()
         $kind        = 'gmsa'
         if (-not $newUser.EndsWith('$')) {
-            Write-Warning "RunAsUser '$newUser' does not end with '$' -- gMSAs are typically of the form DOMAIN\name$."
+            Write-RunAsInfo -Level WARN -m "RunAsUser '$newUser' does not end with '$' -- gMSAs are typically of the form DOMAIN\name$."
         }
     }
     'Credential' {
@@ -117,17 +134,17 @@ if ($VerifyMembership -and $kind -ne 'system') {
             Select-Object -ExpandProperty Name
         $match = $admins | Where-Object { $_ -ieq $newUser -or $_ -ilike "*\$($newUser.Split('\')[-1])" }
         if (-not $match) {
-            Write-Warning "Run-as account '$newUser' does not appear in the local Administrators group on this machine."
-            Write-Warning 'The runner needs admin privileges (writes Program Files, HKLM, services, modules).'
-            Write-Warning 'Add the account to Administrators before this task fires, or pass -VerifyMembership:$false to bypass this check.'
+            Write-RunAsInfo -Level WARN -m "Run-as account '$newUser' does not appear in the local Administrators group on this machine."
+            Write-RunAsInfo -Level WARN -m 'The runner needs admin privileges (writes Program Files, HKLM, services, modules).'
+            Write-RunAsInfo -Level WARN -m 'Add the account to Administrators before this task fires, or pass -VerifyMembership:$false to bypass this check.'
             $confirm = Read-Host 'Continue anyway? [y/N]'
             if ($confirm -notmatch '^(y|yes)$') { throw 'Aborted by user.' }
         }
     } catch [System.UnauthorizedAccessException] {
-        Write-Warning "Could not enumerate local Administrators: $($_.Exception.Message)"
+        Write-RunAsInfo -Level WARN -m "Could not enumerate local Administrators: $($_.Exception.Message)"
     } catch {
         # Get-LocalGroupMember can fail for domain accounts in unusual setups; surface but continue.
-        Write-Warning "Membership check skipped: $($_.Exception.Message)"
+        Write-RunAsInfo -Level WARN -m "Membership check skipped: $($_.Exception.Message)"
     }
 }
 
@@ -187,8 +204,8 @@ if ($kind -ne 'system' -and (Test-Path -LiteralPath $AgentConfig)) {
         Set-Acl -LiteralPath $AgentConfig -AclObject $acl
         Write-Host "    granted Read on $AgentConfig to $newUser"
     } catch {
-        Write-Warning "Could not grant Read on ${AgentConfig}: $_"
-        Write-Warning 'If the run-as account is a local Administrator (required), it already has access via the Administrators ACE.'
+        Write-RunAsInfo -Level WARN -m "Could not grant Read on ${AgentConfig}: $_"
+        Write-RunAsInfo -Level WARN -m 'If the run-as account is a local Administrator (required), it already has access via the Administrators ACE.'
     }
 }
 

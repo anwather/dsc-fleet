@@ -56,10 +56,20 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3.0
 
+# Unified log sink. The runner is installed under \bin\ so the module must be
+# copied there too by Install-DscV3 (which it is). Falls back to host-only if
+# the module is missing (e.g. mid-upgrade).
+$loggingModule = Join-Path $PSScriptRoot 'DscFleet.Logging.psm1'
+if (Test-Path -LiteralPath $loggingModule) { Import-Module $loggingModule -Force }
+
 function Write-RunnerLog {
     param([Parameter(Mandatory, Position = 0)] [string] $Message, [string] $Level = 'INFO')
-    $line = "{0} [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK'), $Level, $Message
-    Write-Host $line
+    if (Get-Command Write-DscFleetLog -ErrorAction SilentlyContinue) {
+        Write-DscFleetLog -Component 'Runner' -Level $Level -Message $Message
+    } else {
+        $line = "{0} [Runner] [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK'), $Level, $Message
+        Write-Host $line
+    }
 }
 
 # ============================================================================

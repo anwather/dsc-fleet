@@ -59,23 +59,31 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3.0
 
+# Bring in the unified logging sink. Self-bootstraps the directory if Install-DscV3
+# hasn't run yet (this script is the first thing to execute on a fresh box).
+$loggingModule = Join-Path $PSScriptRoot 'DscFleet.Logging.psm1'
+if (Test-Path -LiteralPath $loggingModule) { Import-Module $loggingModule -Force }
+
 $logRoot = 'C:\ProgramData\DscV3'
 if (-not (Test-Path -LiteralPath $logRoot)) { New-Item -ItemType Directory -Path $logRoot -Force | Out-Null }
-$logFile = Join-Path $logRoot 'prereq-install.log'
 
 $tempRoot = Join-Path $env:TEMP 'DscV3-bootstrap'
 if (-not (Test-Path -LiteralPath $tempRoot)) { New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null }
 
 function Write-Step([string] $msg) {
-    $line = "[{0:yyyy-MM-ddTHH:mm:ssZ}] ==> {1}" -f [DateTime]::UtcNow, $msg
-    Write-Host $line -ForegroundColor Cyan
-    Add-Content -LiteralPath $logFile -Value $line
+    if (Get-Command Write-DscFleetLog -ErrorAction SilentlyContinue) {
+        Write-DscFleetLog -Component 'Prereq' -Level 'INFO' -Message ('==> ' + $msg)
+    } else {
+        Write-Host ('==> ' + $msg) -ForegroundColor Cyan
+    }
 }
 
 function Write-Info([string] $msg) {
-    $line = "[{0:yyyy-MM-ddTHH:mm:ssZ}]     {1}" -f [DateTime]::UtcNow, $msg
-    Write-Host $line
-    Add-Content -LiteralPath $logFile -Value $line
+    if (Get-Command Write-DscFleetLog -ErrorAction SilentlyContinue) {
+        Write-DscFleetLog -Component 'Prereq' -Level 'INFO' -Message ('    ' + $msg)
+    } else {
+        Write-Host ('    ' + $msg)
+    }
 }
 
 # ---------------------------------------------------------------------------

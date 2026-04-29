@@ -83,7 +83,24 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3.0
 
-function Write-Step([string] $m) { Write-Host "==> $m" -ForegroundColor Cyan }
+$loggingModule = Join-Path $PSScriptRoot 'DscFleet.Logging.psm1'
+if (Test-Path -LiteralPath $loggingModule) { Import-Module $loggingModule -Force }
+
+function Write-Step([string] $m) {
+    if (Get-Command Write-DscFleetLog -ErrorAction SilentlyContinue) {
+        Write-DscFleetLog -Component 'Register' -Level 'INFO' -Message ('==> ' + $m)
+    } else {
+        Write-Host ('==> ' + $m) -ForegroundColor Cyan
+    }
+}
+
+function Write-RegisterInfo([string] $m, [string] $Level = 'INFO') {
+    if (Get-Command Write-DscFleetLog -ErrorAction SilentlyContinue) {
+        Write-DscFleetLog -Component 'Register' -Level $Level -Message ('    ' + $m)
+    } else {
+        Write-Host ('    ' + $m)
+    }
+}
 
 if ((Test-Path -LiteralPath $AgentConfig) -and -not $Force) {
     throw "Agent config already exists at $AgentConfig — pass -Force to overwrite."
