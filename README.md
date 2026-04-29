@@ -31,7 +31,7 @@ The **platform** repo for managing DSC v3 across a fleet of Windows Servers
 | `modules/`       | `DscV3.RegFile` — single custom class-based DSC v3 resource (`RegFile`).        |
 | `schemas/`       | Cached DSC v3 JSON schemas for offline validation in CI.                        |
 | `tests/`         | Pester tests (sync verify, schema, parse).                                      |
-| `docs/`          | `pilot-rollout.md` — staged rollout plan.                                       |
+| `docs/`          | Agent + module reference (see [Documentation](#documentation) below).           |
 | `.github/`       | CI: lint + Pester + sync verify; on-tag release zips.                           |
 
 ## Resource model
@@ -185,6 +185,20 @@ Use the retrofit helper. Runs locally; nothing transits the network:
 - **gMSA prerequisites:** VM must be domain-joined; KDS root key must
   exist; `Test-ADServiceAccount <name>` should return `True` on the VM
   before registering the task.
+
+## Documentation
+
+| Document | What's in it |
+| --- | --- |
+| [`docs/agent-bootstrap.md`](docs/agent-bootstrap.md) | What `Install-Prerequisites.ps1`, `Install-DscV3.ps1`, and `Register-DashboardAgent.ps1` do — arguments, install paths, scheduled-task setup, reprovision flow. |
+| [`docs/runner-loop.md`](docs/runner-loop.md) | `Invoke-DscRunner.ps1` heartbeat loop — config fetch, run-as decryption, `dsc config set`, `dscOutput` posting, log file model. |
+| [`docs/dscv3-regfile-module.md`](docs/dscv3-regfile-module.md) | `DscV3.RegFile` module — manifest (PS 7.2 + Core), parser quirks (`hex(b)`/`hex(2)`/`hex(7)`), install paths, `Sync-Module.ps1`. |
+| [`docs/pilot-rollout.md`](docs/pilot-rollout.md) | Original staged rollout plan (historical — see `agent-bootstrap.md` for current flow). |
+
+The companion dashboard repo
+[anwather/dsc-fleet-dashboard](https://github.com/anwather/dsc-fleet-dashboard)
+holds the deployment runbook, user guide, and operations docs for the
+control plane.
 
 ## Local development
 
