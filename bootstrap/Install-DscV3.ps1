@@ -10,10 +10,15 @@
          (PowerShell 7, dsc.exe, git, PSResourceGet).
       2. Creates the C:\ProgramData\DscV3 layout with locked-down ACL
          (SYSTEM + Administrators full; Users read).
-      3. Clones (or refreshes) the *platform* repo (dsc-fleet) at $PlatformRef
-         into C:\ProgramData\DscV3\platform and installs:
+      3. Shallow-clones the *platform* repo (dsc-fleet) at $PlatformRef into a
+         temporary directory, copies out the artifacts the agent actually
+         needs, then deletes the clone. Nothing from the platform repo
+         (including its git history) is left on the box. Installed:
              * DscV3.RegFile module to the AllUsers module path
              * Invoke-DscRunner.ps1 to C:\ProgramData\DscV3\bin
+         A small manifest is written to state\install.json recording the
+         PlatformRef, resolved commit SHA, and timestamp so the version on
+         the box can be audited without keeping the repo.
 
     NOTE: This script does NOT clone any configs repo and does NOT create the
     DscV3-Apply scheduled task. Both responsibilities belong to
@@ -23,10 +28,8 @@
 
     Layout:
       C:\ProgramData\DscV3\bin       installed runner script
-      C:\ProgramData\DscV3\platform  checkout of dsc-fleet
       C:\ProgramData\DscV3\runs      local fallback run logs (JSON)
-      C:\ProgramData\DscV3\state     per-cycle agent state files
-      C:\ProgramData\DscV3\bootstrap copy of the bootstrap scripts (provision job)
+      C:\ProgramData\DscV3\state     per-cycle agent state files + install.json
 
 .PARAMETER PlatformRepoUrl
     HTTPS URL of the platform repo (default: anwather/dsc-fleet on GitHub).
@@ -56,12 +59,14 @@ Set-StrictMode -Version 3.0
 
 $root = 'C:\ProgramData\DscV3'
 $paths = @{
-    Root     = $root
-    Bin      = Join-Path $root 'bin'
-    Platform = Join-Path $root 'platform'
-    Runs     = Join-Path $root 'runs'
-    State    = Join-Path $root 'state'
+    Root  = $root
+    Bin   = Join-Path $root 'bin'
+    Runs  = Join-Path $root 'runs'
+    State = Join-Path $root 'state'
 }
+# Ephemeral working clone of the platform repo. Created during install,
+# deleted before the script returns. Never persists across runs.
+$platformWork = Join-Path ([System.IO.Path]::GetTempPath()) ("dsc-fleet-install-" + [guid]::NewGuid().ToString('N'))
 
 function Write-Step([string] $message) { Write-Host "==> $message" -ForegroundColor Cyan }
 
@@ -111,7 +116,7 @@ if ($PSCmdlet.ShouldProcess($root, 'Restrict ACL to SYSTEM + Administrators')) {
 }
 
 # --- 3. Helper: clone or refresh a repo --------------------------------------
-function Sync-GitRepo {
+function Get-EphemeralPlatformClone {
     param(
         [Parameter(Mandatory)] [string] $Url,
         [Parameter(Mandatory)] [string] $Ref,
@@ -119,84 +124,125 @@ function Sync-GitRepo {
         [string] $Token = ''
     )
     $authedUrl = Add-TokenToUrl $Url $Token
-    if (Test-Path -LiteralPath (Join-Path $Dest '.git')) {
-        Write-Host "    refresh: $Dest"
-        & $gitPath -C $Dest remote set-url origin $authedUrl | Out-Null
-        & $gitPath -C $Dest fetch --tags --prune origin | Out-Host
-        & $gitPath -C $Dest -c advice.detachedHead=false checkout --force $Ref | Out-Host
-        $isTag = (& $gitPath -C $Dest tag --list $Ref)
-        if (-not $isTag) {
-            & $gitPath -C $Dest reset --hard "origin/$Ref" | Out-Host
-        }
-    } else {
-        Write-Host "    clone : $Url ($Ref) -> $Dest"
+    Write-Host "    clone : $Url ($Ref) -> $Dest (ephemeral, depth=1)"
+    # Shallow clone for speed and to avoid pulling unnecessary history. We
+    # delete the working tree immediately after copying out the artifacts.
+    & $gitPath clone --quiet --depth 1 --branch $Ref $authedUrl $Dest 2>$null | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        # --branch failed (likely a commit SHA, not a branch/tag). Fall back
+        # to a full clone + checkout.
+        if (Test-Path -LiteralPath $Dest) { Remove-Item -LiteralPath $Dest -Recurse -Force }
         & $gitPath clone --quiet $authedUrl $Dest | Out-Host
         & $gitPath -C $Dest -c advice.detachedHead=false checkout --force $Ref | Out-Host
     }
-    & $gitPath -C $Dest remote set-url origin $Url | Out-Null
 }
 
-# --- 4. Platform repo --------------------------------------------------------
-Write-Step "Syncing platform repo $PlatformRepoUrl ($PlatformRef)"
-if ($PSCmdlet.ShouldProcess($paths.Platform, 'Sync platform repo')) {
-    Sync-GitRepo -Url $PlatformRepoUrl -Ref $PlatformRef -Dest $paths.Platform -Token $GitToken
-}
+# --- 4. Platform repo (ephemeral) --------------------------------------------
+# All install steps that depend on the platform clone live inside this
+# try/finally so the temp directory is always removed - even if a later step
+# (module copy, runner copy, manifest write) throws.
+try {
+    Write-Step "Fetching platform repo $PlatformRepoUrl ($PlatformRef) into ephemeral work dir"
+    if ($PSCmdlet.ShouldProcess($platformWork, 'Clone platform repo to temp')) {
+        Get-EphemeralPlatformClone -Url $PlatformRepoUrl -Ref $PlatformRef -Dest $platformWork -Token $GitToken
+    }
 
-# --- 5. Install module + runner from platform repo ---------------------------
-Write-Step 'Installing DscV3.RegFile module to AllUsers module path'
-$moduleSrc = Join-Path $paths.Platform 'modules\DscV3.RegFile'
-$moduleDst = 'C:\Program Files\WindowsPowerShell\Modules\DscV3.RegFile'
-if (-not (Test-Path -LiteralPath $moduleSrc)) { throw "Module source missing: $moduleSrc" }
-if ($PSCmdlet.ShouldProcess($moduleDst, 'Replace module from platform checkout')) {
-    if (Test-Path -LiteralPath $moduleDst) { Remove-Item -LiteralPath $moduleDst -Recurse -Force }
-    Copy-Item -LiteralPath $moduleSrc -Destination $moduleDst -Recurse -Force
-}
-$ps7ModuleDst = 'C:\Program Files\PowerShell\Modules\DscV3.RegFile'
-if (Test-Path 'C:\Program Files\PowerShell\Modules') {
-    if ($PSCmdlet.ShouldProcess($ps7ModuleDst, 'Mirror module to PS7 AllUsers path')) {
-        if (Test-Path -LiteralPath $ps7ModuleDst) { Remove-Item -LiteralPath $ps7ModuleDst -Recurse -Force }
-        Copy-Item -LiteralPath $moduleSrc -Destination $ps7ModuleDst -Recurse -Force
+    # Capture the resolved commit so we have an audit trail without keeping the repo.
+    $installedSha = (& $gitPath -C $platformWork rev-parse HEAD).Trim()
+
+    # --- 5. Install module + runner from platform repo -----------------------
+    Write-Step 'Installing DscV3.RegFile module to AllUsers module path'
+    $moduleSrc = Join-Path $platformWork 'modules\DscV3.RegFile'
+    $moduleDst = 'C:\Program Files\WindowsPowerShell\Modules\DscV3.RegFile'
+    if (-not (Test-Path -LiteralPath $moduleSrc)) { throw "Module source missing: $moduleSrc" }
+    if ($PSCmdlet.ShouldProcess($moduleDst, 'Replace module from platform checkout')) {
+        if (Test-Path -LiteralPath $moduleDst) { Remove-Item -LiteralPath $moduleDst -Recurse -Force }
+        Copy-Item -LiteralPath $moduleSrc -Destination $moduleDst -Recurse -Force
+    }
+    $ps7ModuleDst = 'C:\Program Files\PowerShell\Modules\DscV3.RegFile'
+    if (Test-Path 'C:\Program Files\PowerShell\Modules') {
+        if ($PSCmdlet.ShouldProcess($ps7ModuleDst, 'Mirror module to PS7 AllUsers path')) {
+            if (Test-Path -LiteralPath $ps7ModuleDst) { Remove-Item -LiteralPath $ps7ModuleDst -Recurse -Force }
+            Copy-Item -LiteralPath $moduleSrc -Destination $ps7ModuleDst -Recurse -Force
+        }
+    }
+    foreach ($legacy in @(
+        'C:\Program Files\WindowsPowerShell\Modules\DscV3.Discovery'
+        'C:\Program Files\PowerShell\Modules\DscV3.Discovery'
+    )) {
+        if (Test-Path -LiteralPath $legacy) {
+            Write-Host "    removing legacy module: $legacy"
+            Remove-Item -LiteralPath $legacy -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Write-Step "Installing runner to $($paths.Bin)"
+    $runnerSrc = Join-Path $platformWork 'bootstrap\Invoke-DscRunner.ps1'
+    $runnerDst = Join-Path $paths.Bin     'Invoke-DscRunner.ps1'
+    if (-not (Test-Path -LiteralPath $runnerSrc)) { throw "Runner source missing: $runnerSrc" }
+    if ($PSCmdlet.ShouldProcess($runnerDst, 'Copy runner')) {
+        Copy-Item -LiteralPath $runnerSrc -Destination $runnerDst -Force
+    }
+
+    $cache = "$env:LOCALAPPDATA\dsc\PSAdapterCache.json"
+    if (Test-Path -LiteralPath $cache) { Remove-Item -LiteralPath $cache -Force }
+
+    # --- 6. Remove any pre-existing DscV3-Apply task -------------------------
+    # Earlier versions of this script registered a git-mode scheduled task here.
+    # Dashboard provisioning hands ownership of the task to
+    # Register-DashboardAgent.ps1, so we proactively unregister any existing one
+    # to make sure the dashboard re-registration is the only definition that
+    # survives.
+    $existing = Get-ScheduledTask -TaskName 'DscV3-Apply' -ErrorAction SilentlyContinue
+    if ($existing) {
+        if ($PSCmdlet.ShouldProcess('DscV3-Apply', 'Unregister legacy scheduled task (will be re-created by Register-DashboardAgent)')) {
+            Unregister-ScheduledTask -TaskName 'DscV3-Apply' -Confirm:$false
+        }
+    }
+
+    # --- 7. Remove any stale legacy git-mode configs checkout ----------------
+    $legacyRepo = Join-Path $root 'repo'
+    if (Test-Path -LiteralPath $legacyRepo) {
+        if ($PSCmdlet.ShouldProcess($legacyRepo, 'Remove legacy configs checkout')) {
+            Remove-Item -LiteralPath $legacyRepo -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- 8. Remove legacy persistent platform checkout -----------------------
+    # Earlier installer revisions kept C:\ProgramData\DscV3\platform on disk
+    # permanently. The agent never reads from it after install completes, so we
+    # proactively delete it to keep the box clean and to avoid leaving project
+    # git history on production servers.
+    $legacyPlatform = Join-Path $root 'platform'
+    if (Test-Path -LiteralPath $legacyPlatform) {
+        if ($PSCmdlet.ShouldProcess($legacyPlatform, 'Remove legacy persistent platform checkout')) {
+            Write-Host "    removing legacy persistent platform checkout: $legacyPlatform"
+            Remove-Item -LiteralPath $legacyPlatform -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- 9. Write install manifest -------------------------------------------
+    $manifest = [ordered]@{
+        PlatformRepoUrl = $PlatformRepoUrl
+        PlatformRef     = $PlatformRef
+        PlatformCommit  = $installedSha
+        DscVersion      = $DscVersion
+        InstalledAtUtc  = (Get-Date).ToUniversalTime().ToString('o')
+    }
+    $manifestPath = Join-Path $paths.State 'install.json'
+    if ($PSCmdlet.ShouldProcess($manifestPath, 'Write install manifest')) {
+        $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
     }
 }
-foreach ($legacy in @(
-    'C:\Program Files\WindowsPowerShell\Modules\DscV3.Discovery'
-    'C:\Program Files\PowerShell\Modules\DscV3.Discovery'
-)) {
-    if (Test-Path -LiteralPath $legacy) {
-        Write-Host "    removing legacy module: $legacy"
-        Remove-Item -LiteralPath $legacy -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-
-Write-Step "Installing runner to $($paths.Bin)"
-$runnerSrc = Join-Path $paths.Platform 'bootstrap\Invoke-DscRunner.ps1'
-$runnerDst = Join-Path $paths.Bin     'Invoke-DscRunner.ps1'
-if (-not (Test-Path -LiteralPath $runnerSrc)) { throw "Runner source missing: $runnerSrc" }
-if ($PSCmdlet.ShouldProcess($runnerDst, 'Copy runner')) {
-    Copy-Item -LiteralPath $runnerSrc -Destination $runnerDst -Force
-}
-
-$cache = "$env:LOCALAPPDATA\dsc\PSAdapterCache.json"
-if (Test-Path -LiteralPath $cache) { Remove-Item -LiteralPath $cache -Force }
-
-# --- 6. Remove any pre-existing DscV3-Apply task -----------------------------
-# Earlier versions of this script registered a git-mode scheduled task here.
-# Dashboard provisioning hands ownership of the task to
-# Register-DashboardAgent.ps1, so we proactively unregister any existing one
-# to make sure the dashboard re-registration is the only definition that
-# survives.
-$existing = Get-ScheduledTask -TaskName 'DscV3-Apply' -ErrorAction SilentlyContinue
-if ($existing) {
-    if ($PSCmdlet.ShouldProcess('DscV3-Apply', 'Unregister legacy scheduled task (will be re-created by Register-DashboardAgent)')) {
-        Unregister-ScheduledTask -TaskName 'DscV3-Apply' -Confirm:$false
-    }
-}
-
-# --- 7. Remove any stale legacy git-mode configs checkout --------------------
-$legacyRepo = Join-Path $root 'repo'
-if (Test-Path -LiteralPath $legacyRepo) {
-    if ($PSCmdlet.ShouldProcess($legacyRepo, 'Remove legacy configs checkout')) {
-        Remove-Item -LiteralPath $legacyRepo -Recurse -Force -ErrorAction SilentlyContinue
+finally {
+    # --- 10. Delete ephemeral platform clone (always) ------------------------
+    if (Test-Path -LiteralPath $platformWork) {
+        Write-Step "Removing ephemeral platform clone $platformWork"
+        # .git pack files have read-only attributes that block plain Remove-Item
+        # on Windows; clear them first.
+        Get-ChildItem -LiteralPath $platformWork -Recurse -Force -ErrorAction SilentlyContinue |
+            ForEach-Object { try { $_.Attributes = 'Normal' } catch { } }
+        Remove-Item -LiteralPath $platformWork -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
