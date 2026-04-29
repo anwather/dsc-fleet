@@ -218,7 +218,7 @@ if ($CredentialUrl) {
     else {
         throw "Unknown run-as credential kind: '$($resp.kind)'"
     }
-    Write-Host "    fetched run-as kind=$RunAsUser($($RunAsGmsa.IsPresent))"
+    Write-Host "    fetched run-as user=$RunAsUser gmsa=$($RunAsGmsa.IsPresent)"
 }
 
 $builtIn = @('NT AUTHORITY\SYSTEM','SYSTEM','NT AUTHORITY\NetworkService','NetworkService','NT AUTHORITY\LocalService','LocalService')
