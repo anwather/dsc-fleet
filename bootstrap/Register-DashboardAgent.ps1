@@ -107,11 +107,11 @@ $body = @{
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$resp = Invoke-RestMethod -Method POST -Uri "$base/api/agents/register" `
+$registerResp = Invoke-RestMethod -Method POST -Uri "$base/api/agents/register" `
     -ContentType 'application/json' -Body $body -TimeoutSec 60
 
-if (-not $resp.agentId -or -not $resp.agentApiKey) {
-    throw "Register response missing agentId / agentApiKey: $($resp | ConvertTo-Json -Compress)"
+if (-not $registerResp.agentId -or -not $registerResp.agentApiKey) {
+    throw "Register response missing agentId / agentApiKey: $($registerResp | ConvertTo-Json -Compress)"
 }
 
 # --- 2. Persist agent.config.json with restrictive ACL ----------------------
@@ -121,8 +121,8 @@ if (-not (Test-Path -LiteralPath $configDir)) { New-Item -ItemType Directory -Pa
 
 $configObj = [pscustomobject]@{
     DashboardUrl   = $base
-    AgentId        = $resp.agentId
-    AgentApiKey    = $resp.agentApiKey
+    AgentId        = $registerResp.agentId
+    AgentApiKey    = $registerResp.agentApiKey
     RegisteredUtc  = (Get-Date).ToUniversalTime().ToString('o')
     Hostname       = $env:COMPUTERNAME
 }
@@ -304,8 +304,8 @@ $heartbeatBody = @{
 } | ConvertTo-Json -Compress
 
 try {
-    Invoke-RestMethod -Method POST -Uri "$base/api/agents/$($resp.agentId)/heartbeat" `
-        -Headers @{ 'Authorization' = "Bearer $($resp.agentApiKey)" } `
+    Invoke-RestMethod -Method POST -Uri "$base/api/agents/$($registerResp.agentId)/heartbeat" `
+        -Headers @{ 'Authorization' = "Bearer $($registerResp.agentApiKey)" } `
         -ContentType 'application/json' -Body $heartbeatBody -TimeoutSec 30 | Out-Null
     Write-Host 'Initial heartbeat OK.'
 } catch {
@@ -316,7 +316,7 @@ Write-Step 'Registration complete'
 Write-Host @"
 
 Dashboard       : $base
-Agent ID        : $($resp.agentId)
+Agent ID        : $($registerResp.agentId)
 Config file     : $AgentConfig
 Scheduled task  : $taskName  (every $ScheduleEverySeconds s)
 
